@@ -4,6 +4,7 @@ mod identity;
 mod state;
 mod network;
 mod api;
+mod rag;
 
 use crate::config::Config;
 use crate::history::UpdateHistory;
@@ -37,6 +38,10 @@ struct MLEngineOutput {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // reqwest (used for the RAG sidecar) panics without a process-wide TLS
+    // crypto provider; see the note on `rustls` in Cargo.toml.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Parse command line args
     let args: Vec<String> = std::env::args().collect();
 
@@ -95,9 +100,29 @@ async fn main() -> Result<(), BoxError> {
         net.start().await?;
     }
 
+    // Start the RAG sidecar, if this node serves queries. `_sidecar` owns the
+    // child process and must live until the node exits.
+    let (rag_service, _sidecar) = if config.rag.enabled {
+        let client = crate::rag::sidecar::SidecarClient::new(config.rag.sidecar_port);
+        let child = if config.rag.spawn_sidecar {
+            Some(crate::rag::sidecar::spawn_sidecar(&config.rag, &config.node, &client).await?)
+        } else {
+            None
+        };
+        if let Some(corpus_dir) = &config.rag.corpus_dir {
+            let result = client.ingest(&serde_json::json!({ "path": corpus_dir })).await?;
+            info!("📚 Ingested {}: {}", corpus_dir, result);
+        }
+        info!("📚 RAG sidecar ready: {}", client.health().await?);
+        let service = crate::rag::RagService::new(config.rag.clone(), client, config.node.id.clone());
+        (Some(Arc::new(service)), child)
+    } else {
+        (None, None)
+    };
+
     // Start API server
     let api_handle = tokio::spawn(
-        start_api_server(config.clone(), history.clone(), state.clone(), network.clone())
+        start_api_server(config.clone(), history.clone(), state.clone(), network.clone(), rag_service)
     );
 
     let hist = history.clone();
@@ -459,4 +484,4 @@ fn print_banner() {
 ╚═══════════════════════════════════════════════════════════════╝
 "#
     );
-}
+}

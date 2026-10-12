@@ -57,7 +57,7 @@ The sidecar never talks to the network. All peer traffic goes through Rust and I
 | Document loading | PDF via `pypdf`, plus `.txt` and `.md` | The test corpus is PDF. |
 | Chunk metadata | `chunks.jsonl` next to the index | Readable, easy to debug. |
 | Chunking | Fixed windows of about 200 words with 40 words of overlap | Simplest reasonable default. |
-| Generator | Pluggable. Default (confirmed by the user): Ollama on localhost with a small model (`llama3.2:3b`, or `qwen2.5:1.5b` if too slow). Mode `none` returns merged chunks without an answer. | Only the node that receives the query generates. `none` lets retrieval be tested and evaluated without an LLM. |
+| Generator | Pluggable. Default (confirmed by the user): Ollama on localhost with `qwen2.5:1.5b` (already installed on machine 1; `llama3.2:3b` is a stronger option if disk and memory allow). Mode `none` returns merged chunks without an answer. | Only the node that receives the query generates. `none` lets retrieval be tested and evaluated without an LLM. |
 | Sidecar server | FastAPI + uvicorn | Small and standard. |
 
 ### 3.4 Merging
@@ -150,7 +150,7 @@ final_k = 5                # chunks kept after merging
 peer_timeout_ms = 5000
 max_message_bytes = 1048576
 generator = "ollama"       # "ollama" | "none"
-generator_model = "llama3.2:3b"
+generator_model = "qwen2.5:1.5b"
 generator_url = "http://127.0.0.1:11434"
 ```
 
@@ -263,17 +263,39 @@ Each phase ends with something runnable. Do not start a phase until the previous
 
 1. **Generator:** a local Ollama model is acceptable.
 2. **Corpus:** built by Claude from Wikipedia as PDFs; see `corpus/README.md`.
-3. **Network:** both CPU machines are on the same LAN today, so mDNS discovery should work with `peers = []`. This may change, so pinned addresses (`<EndpointId>@ip:port`) and `relay = true` must keep working and are part of the Phase 4 check.
+3. **Network (corrected 2026-10-12):** the machines are **not** on one LAN. Machine 1 (the user's laptop) reaches machine 2 (`192.168.3.143`) only through a FortiClient VPN, so mDNS does not work between them. Node 1 pins node 2 in `network.peers` as `<EndpointId>@192.168.3.143:9001` and starts the connection; UDP from machine 1 to machine 2 is confirmed to work, the reverse direction is untested. Originally assumed: same LAN with `peers = []`. This may change, so pinned addresses (`<EndpointId>@ip:port`) and `relay = true` must keep working and are part of the Phase 4 check.
 4. **Training:** RAG nodes are always training-off for now. `training.enabled` stays a plain switch so running both together remains possible later.
 
 ## 10. Status checklist
 
 - [x] Test corpus and question set (`corpus/`)
 - [x] Phase 0a — training switch (`[training] enabled`), `examples/rag-2node/` configs, two nodes connect on one machine (done 2026-10-11)
-- [ ] Phase 0b — the same two nodes connect across the two machines (user to run on the second machine)
-- [ ] Phase 1 — sidecar standalone
-- [ ] Phase 2 — single-node `/rag/query`
+- [x] Phase 0b — the two nodes connect across the two machines (done 2026-10-12, over the VPN with a pinned address)
+- [x] Phase 1 — sidecar standalone (done 2026-10-12; see section 11)
+- [x] Phase 2 — single-node `/rag/query` (done 2026-10-12; see section 12)
 - [ ] Phase 3 — two nodes, one machine
 - [ ] Phase 4 — two machines
 - [ ] Phase 5 — 4/6/8 nodes
 - [ ] Phase 6 — evaluation
+
+## 11. Phase 1 results (2026-10-12, machine 1)
+
+- Environment: `.venv-rag` built from `requirements-rag.txt` (CPU torch). The Rust node will have to launch the sidecar with this environment's `python`, not the Bhaskera one.
+- `corpus/node1` ingests to 161 chunks in about 20 s, most of it model loading. The sidecar is ready about 13 s after start.
+- Retrieval takes 20–400 ms per query on this machine.
+- Generation with `qwen2.5:1.5b` takes 21–32 s per answer with 5 chunks of context. This will dominate end-to-end latency; fewer or shorter chunks would cut it.
+- All 6 `node1_only` questions were answered correctly from node 1's index.
+- A `node2_only` question (q07) asked of node 1 alone produced a confident wrong answer ("Allahabad") instead of "the context does not contain it". This is the local-only baseline the peer request should fix, and it shows the small model does not reliably refuse.
+- Chunk 0 of every PDF starts with the source/licence line added by the corpus builder; it ranks high for many queries because it also contains the article's opening paragraph.
+
+## 12. Phase 2 results and deviations (2026-10-12, machine 1)
+
+- `POST /rag/query`, `POST /rag/ingest`, `GET /rag/status` work on node 1. The three sampled `node1_only` questions were answered correctly through the node, 25–29 s each, almost all of it generation.
+- The node launches the sidecar itself, ingests `corpus_dir` at startup (already-indexed files are skipped), and the API comes up about 14 s after start.
+- `scope` is accepted but peers are not consulted yet: `all` and `local` both use only the local index, and `peers` returns no contexts.
+- When no chunks are retrieved the node skips generation and returns an empty answer. Without this the model answered from memory (and wrongly).
+- Added to the plan's `[rag]` fields: `python` (interpreter with the RAG dependencies, default `.venv-rag/bin/python`). `corpus_dir` is optional. `peer_timeout_ms` and `max_message_bytes` are deferred to Phase 3.
+- The sidecar gets `--exit-with-parent` and stops by itself if the node dies, including on `kill -9`.
+- `reqwest` needed a TLS crypto provider installed at the top of `main()` (`rustls` with `ring`), because Iroh's feature flags apply to our copy of `reqwest` too. Without it the node panics when the first HTTP client is built.
+- Machine 2 needs the same setup before Phase 4: `.venv-rag`, Ollama with `qwen2.5:1.5b`, and the `corpus/` folder.
+

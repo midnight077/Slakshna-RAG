@@ -14,6 +14,8 @@ pub struct Config {
     pub network: NetworkConfig,
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    #[serde(default)]
+    pub rag: RagConfig,
     pub logging: LoggingConfig,
 }
 
@@ -170,6 +172,72 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// Retrieval-augmented generation. Off unless `[rag] enabled = true`.
+///
+/// The ML work is done by a local Python sidecar (`rag_engine.py`) that the
+/// node launches and talks to over HTTP on 127.0.0.1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Local port of this node's sidecar. Must be unique per node on a shared machine.
+    #[serde(default = "default_sidecar_port")]
+    pub sidecar_port: u16,
+    /// Launch the sidecar as a child process. Set false to use one started by hand.
+    #[serde(default = "default_true")]
+    pub spawn_sidecar: bool,
+    /// Python interpreter that has the RAG dependencies installed.
+    #[serde(default = "default_rag_python")]
+    pub python: String,
+    /// Folder of PDF/.txt/.md files to ingest at startup. Files already in the
+    /// index are skipped, so this is cheap after the first run.
+    #[serde(default)]
+    pub corpus_dir: Option<String>,
+    /// Must be the same on every node: chunks from different nodes are ranked
+    /// against each other by their similarity scores.
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+    /// Chunks requested from each node's index.
+    #[serde(default = "default_rag_k")]
+    pub top_k: usize,
+    /// Chunks kept after merging, and passed to the generator.
+    #[serde(default = "default_rag_k")]
+    pub final_k: usize,
+    /// "ollama", or "none" to return retrieved chunks without an answer.
+    #[serde(default = "default_generator")]
+    pub generator: String,
+    #[serde(default = "default_generator_model")]
+    pub generator_model: String,
+    #[serde(default = "default_generator_url")]
+    pub generator_url: String,
+}
+
+fn default_sidecar_port() -> u16 { 8600 }
+fn default_rag_python() -> String { ".venv-rag/bin/python".to_string() }
+fn default_embedding_model() -> String { "sentence-transformers/all-MiniLM-L6-v2".to_string() }
+fn default_rag_k() -> usize { 5 }
+fn default_generator() -> String { "ollama".to_string() }
+fn default_generator_model() -> String { "qwen2.5:1.5b".to_string() }
+fn default_generator_url() -> String { "http://127.0.0.1:11434".to_string() }
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        RagConfig {
+            enabled: false,
+            sidecar_port: default_sidecar_port(),
+            spawn_sidecar: true,
+            python: default_rag_python(),
+            corpus_dir: None,
+            embedding_model: default_embedding_model(),
+            top_k: default_rag_k(),
+            final_k: default_rag_k(),
+            generator: default_generator(),
+            generator_model: default_generator_model(),
+            generator_url: default_generator_url(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     pub level: String,
@@ -195,6 +263,12 @@ impl Config {
         }
         if config.compression.max_tensor_elements == 0 {
             return Err("compression.max_tensor_elements must be positive".into());
+        }
+        if config.rag.top_k == 0 || config.rag.final_k == 0 {
+            return Err("rag.top_k and rag.final_k must be positive".into());
+        }
+        if config.rag.generator != "ollama" && config.rag.generator != "none" {
+            return Err("rag.generator must be \"ollama\" or \"none\"".into());
         }
         Ok(config)
     }

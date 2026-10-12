@@ -19,7 +19,15 @@ api_port = 8545             # Status pages: http://<this machine>:8545/status
 ws_port = 8546
 # Empty is fine on one local network. If the nodes cannot find each other, put the
 # other node's EndpointId and address here:  peers = ["<EndpointId>@<ip>:<p2p_port>"]
-peers = []
+peers = ["313823248f8db7f0eb045da53dbb5e938caa077ae475cae8baaab3e253245652@192.168.3.143:9001"]
+
+[rag]
+enabled = true
+sidecar_port = 8600         # Local port of this node's Python helper; unique per node on one machine
+python = ".venv-rag/bin/python"
+corpus_dir = "corpus/node1"  # Documents this node indexes at startup
+generator = "ollama"        # "none" returns the retrieved passages without writing an answer
+generator_model = "qwen2.5:1.5b"
 
 [discovery]
 mdns = true                 # Find other nodes on the same local network automatically

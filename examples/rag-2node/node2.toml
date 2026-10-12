@@ -21,6 +21,14 @@ ws_port = 8547
 # other node's EndpointId and address here:  peers = ["<EndpointId>@<ip>:<p2p_port>"]
 peers = []
 
+[rag]
+enabled = true
+sidecar_port = 8601         # Local port of this node's Python helper; unique per node on one machine
+python = ".venv-rag/bin/python"
+corpus_dir = "corpus/node2"  # Documents this node indexes at startup
+generator = "ollama"        # "none" returns the retrieved passages without writing an answer
+generator_model = "qwen2.5:1.5b"
+
 [discovery]
 mdns = true                 # Find other nodes on the same local network automatically
 dht = false                 # Internet-wide lookup; not needed on one local network

@@ -28,13 +28,22 @@ bash setup.sh                                # Python deps, runtime dirs, releas
 
 cargo check                                  # fast validation of Rust changes
 cargo build --release                        # produces target/release/iiitd
-cargo test                                   # Rust unit tests (identity.rs has the only ones today)
+cargo test --release                         # Rust unit tests (identity.rs, rag/mod.rs); --release reuses the built dependencies
 cargo fmt --check
 
 python -m unittest tests/test_delta_transport.py   # delta wire-format tests (needs torch)
 python ml_engine.py <my_id> <peer_id...>            # one ML epoch with no networking
 
+# RAG sidecar (Python, separate environment from Bhaskera)
+uv venv .venv-rag --python 3.11
+uv pip install --python .venv-rag/bin/python --torch-backend cpu -r requirements-rag.txt
+.venv-rag/bin/python -m unittest tests/test_rag_store.py
+.venv-rag/bin/python rag_engine.py ingest --data-dir ./data-rag-node1 --path corpus/node1
+.venv-rag/bin/python rag_engine.py serve --data-dir ./data-rag-node1 --port 8600   # needs Ollama running
+
 ./target/release/iiitd --config node1.toml   # run one node
+./target/release/iiitd --config examples/rag-2node/node1.toml   # RAG node: no training, starts its own sidecar
+curl localhost:8545/rag/query -H 'content-type: application/json' -d '{"query": "..."}'
 ./start_cluster.sh 2                         # 2, 4 or 6 local nodes from examples/<N>node/, logs in logs/
 ./stop_cluster.sh
 ```
@@ -65,6 +74,8 @@ Always run from the repository root: the node spawns `python ml_engine.py` with 
         │ Bhaskera/ (submodule)   │  distributed LLM training framework
         └─────────────────────────┘
 ```
+
+The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running local HTTP service: PDF loading, chunking, embeddings, a FAISS index in `{data_dir}/rag/`, and answer generation through Ollama. When `[rag] enabled = true` the node launches it at startup (`src/rag/sidecar.rs`), and `src/rag/mod.rs` runs the query pipeline behind `POST /rag/query`, `POST /rag/ingest` and `GET /rag/status`. Peers are not consulted yet (Phase 3 of the plan).
 
 ### One epoch (`src/main.rs`)
 
