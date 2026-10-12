@@ -273,7 +273,7 @@ Each phase ends with something runnable. Do not start a phase until the previous
 - [x] Phase 0b — the two nodes connect across the two machines (done 2026-10-12, over the VPN with a pinned address)
 - [x] Phase 1 — sidecar standalone (done 2026-10-12; see section 11)
 - [x] Phase 2 — single-node `/rag/query` (done 2026-10-12; see section 12)
-- [ ] Phase 3 — two nodes, one machine
+- [x] Phase 3 — two nodes, one machine (done 2026-10-12; see section 13)
 - [ ] Phase 4 — two machines
 - [ ] Phase 5 — 4/6/8 nodes
 - [ ] Phase 6 — evaluation
@@ -299,3 +299,23 @@ Each phase ends with something runnable. Do not start a phase until the previous
 - `reqwest` needed a TLS crypto provider installed at the top of `main()` (`rustls` with `ring`), because Iroh's feature flags apply to our copy of `reqwest` too. Without it the node panics when the first HTTP client is built.
 - Machine 2 needs the same setup before Phase 4: `.venv-rag`, Ollama with `qwen2.5:1.5b`, and the `corpus/` folder.
 
+## 13. Phase 3 results (2026-10-12, both nodes on machine 1)
+
+Implemented as planned: `src/rag/protocol.rs` (`RagProtocol` handler, `query_peer`), concurrent fan-out in `RagService::query`, router registration and `rag_link()` in `src/network/mesh.rs`. The sidecar now starts before the network so the mesh can register the handler. `GET /rag/status` lists `peer_targets`.
+
+All 15 questions asked of node 1 with `scope: "all"`:
+
+| Type | Correct | Notes |
+| :-- | :-- | :-- |
+| `node1_only` | 6 / 6 | Peer chunks did not displace the right local ones. |
+| `node2_only` | 6 / 6 | Contexts came from node 2's index. With `scope: "local"`, q07 was answered wrongly ("Allahabad"). |
+| `cross_node` | 0 / 3 | See below. |
+
+- Peer round trip on one machine: 18–28 ms. Whole retrieval step: about 55 ms. Generation: 12–18 s.
+- The reverse direction works: node 2 answered a `node1_only` question using node 1's chunks.
+- Node 2 killed: its entry reports `timeout` after the full 5 s `peer_timeout_ms`, and node 1 answers from local chunks only, without an error.
+- Machine 2's node was still on the pre-RAG build. Asking it failed in 55 ms with "peer doesn't support any known protocol" and was reported as `error`; the query carried on. So old and new builds can share a federation.
+
+**Cross-node questions fail, and this is a retrieval limit, not a transport bug.** Each needs one fact from each node, but the question is embedded once and its wording matches one topic much more strongly. For q13 all five merged chunks came from node 1's Chandrayaan documents; node 2's Satish Dhawan chunk scored lower and was cut by `final_k`. A global top-k by score cannot guarantee both halves are present. Options to evaluate later: reserve a share of `final_k` per node, raise `final_k`, rerank, or break the question into sub-questions. A stronger generator is also needed: with the right chunks missing, the 1.5B model guesses instead of refusing.
+
+**Stale peers cost the full timeout.** A peer that is remembered but down delays every query by `peer_timeout_ms` (5 s). Worth fixing before 8 nodes: skip peers not seen recently, or lower the timeout.

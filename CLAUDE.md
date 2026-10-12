@@ -75,7 +75,7 @@ Always run from the repository root: the node spawns `python ml_engine.py` with 
         └─────────────────────────┘
 ```
 
-The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running local HTTP service: PDF loading, chunking, embeddings, a FAISS index in `{data_dir}/rag/`, and answer generation through Ollama. When `[rag] enabled = true` the node launches it at startup (`src/rag/sidecar.rs`), and `src/rag/mod.rs` runs the query pipeline behind `POST /rag/query`, `POST /rag/ingest` and `GET /rag/status`. Peers are not consulted yet (Phase 3 of the plan).
+The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running local HTTP service: PDF loading, chunking, embeddings, a FAISS index in `{data_dir}/rag/`, and answer generation through Ollama. When `[rag] enabled = true` the node launches it at startup (`src/rag/sidecar.rs`), and `src/rag/mod.rs` runs the query pipeline behind `POST /rag/query`, `POST /rag/ingest` and `GET /rag/status`. Peers are asked for chunks over a second Iroh protocol, `/slakshna/rag/1` (`src/rag/protocol.rs`): one QUIC stream per query, JSON request and response, sent to every live or remembered peer at once with a per-peer timeout. A peer that is down or runs a build without RAG is reported in the response's `peers` list and skipped.
 
 ### One epoch (`src/main.rs`)
 

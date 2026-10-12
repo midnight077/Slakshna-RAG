@@ -89,17 +89,6 @@ async fn main() -> Result<(), BoxError> {
         RwLock::new(UpdateHistory::new(config.clone(), state.clone(), node_identity.clone()).await?)
     );
 
-    // Initialize network
-    let network = Arc::new(
-        RwLock::new(crate::network::mesh::MeshNetwork::new(config.clone(), history.clone(), state.clone()))
-    );
-
-    // Start network
-    {
-        let mut net = network.write().await;
-        net.start().await?;
-    }
-
     // Start the RAG sidecar, if this node serves queries. `_sidecar` owns the
     // child process and must live until the node exits.
     let (rag_service, _sidecar) = if config.rag.enabled {
@@ -119,6 +108,20 @@ async fn main() -> Result<(), BoxError> {
     } else {
         (None, None)
     };
+
+    // Initialize network
+    let network = Arc::new(
+        RwLock::new(crate::network::mesh::MeshNetwork::new(config.clone(), history.clone(), state.clone()))
+    );
+
+    // Start network
+    {
+        let mut net = network.write().await;
+        if let Some(rag) = &rag_service {
+            net.set_rag_service(rag.clone());
+        }
+        net.start().await?;
+    }
 
     // Start API server
     let api_handle = tokio::spawn(

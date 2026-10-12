@@ -203,6 +203,12 @@ pub struct RagConfig {
     /// Chunks kept after merging, and passed to the generator.
     #[serde(default = "default_rag_k")]
     pub final_k: usize,
+    /// How long to wait for one peer's chunks before answering without them.
+    #[serde(default = "default_peer_timeout_ms")]
+    pub peer_timeout_ms: u64,
+    /// Largest request or response accepted on the peer RAG protocol.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
     /// "ollama", or "none" to return retrieved chunks without an answer.
     #[serde(default = "default_generator")]
     pub generator: String,
@@ -216,6 +222,8 @@ fn default_sidecar_port() -> u16 { 8600 }
 fn default_rag_python() -> String { ".venv-rag/bin/python".to_string() }
 fn default_embedding_model() -> String { "sentence-transformers/all-MiniLM-L6-v2".to_string() }
 fn default_rag_k() -> usize { 5 }
+fn default_peer_timeout_ms() -> u64 { 5000 }
+fn default_max_message_bytes() -> usize { 1024 * 1024 }
 fn default_generator() -> String { "ollama".to_string() }
 fn default_generator_model() -> String { "qwen2.5:1.5b".to_string() }
 fn default_generator_url() -> String { "http://127.0.0.1:11434".to_string() }
@@ -231,6 +239,8 @@ impl Default for RagConfig {
             embedding_model: default_embedding_model(),
             top_k: default_rag_k(),
             final_k: default_rag_k(),
+            peer_timeout_ms: default_peer_timeout_ms(),
+            max_message_bytes: default_max_message_bytes(),
             generator: default_generator(),
             generator_model: default_generator_model(),
             generator_url: default_generator_url(),

@@ -266,7 +266,8 @@ async fn rag_query(
     if request.query.trim().is_empty() {
         return rag_error(StatusCode::BAD_REQUEST, "empty_query", "query must not be empty".to_string());
     }
-    match rag.query(request).await {
+    let link = state.network.read().await.rag_link().await;
+    match rag.query(request, link).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => rag_error(StatusCode::BAD_GATEWAY, "rag_failed", e.to_string()),
     }
@@ -287,10 +288,15 @@ async fn rag_ingest(
 
 async fn rag_status(AxumState(state): AxumState<SharedState>) -> impl IntoResponse {
     let Some(rag) = &state.rag else { return rag_disabled() };
+    let targets: Vec<String> = match state.network.read().await.rag_link().await {
+        Some(link) => link.targets.iter().map(|id| id.to_string()).collect(),
+        None => Vec::new(),
+    };
     match rag.sidecar.health().await {
         Ok(sidecar) => Json(serde_json::json!({
             "success": true,
             "sidecar": sidecar,
+            "peer_targets": targets,
             "top_k": rag.config.top_k,
             "final_k": rag.config.final_k
         })).into_response(),
