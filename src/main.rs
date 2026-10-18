@@ -137,6 +137,11 @@ async fn main() -> Result<(), BoxError> {
         net.start().await?;
     }
 
+    // Keep peers' signed RAG roots fresh, so queries can skip peers that are down.
+    if let Some(rag) = &rag_service {
+        tokio::spawn(crate::rag::run_root_refresh(rag.clone(), network.clone()));
+    }
+
     // Start API server
     let api_handle = tokio::spawn(
         start_api_server(config.clone(), history.clone(), state.clone(), network.clone(), rag_service)

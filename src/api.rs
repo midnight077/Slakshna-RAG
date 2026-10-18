@@ -295,16 +295,18 @@ async fn rag_ingest(
 
 async fn rag_status(AxumState(state): AxumState<SharedState>) -> impl IntoResponse {
     let Some(rag) = &state.rag else { return rag_disabled() };
-    let targets: Vec<String> = match state.network.read().await.rag_link().await {
-        Some(link) => link.targets.iter().map(|id| id.to_string()).collect(),
+    let target_ids: Vec<iroh::EndpointId> = match state.network.read().await.rag_link().await {
+        Some(link) => link.targets,
         None => Vec::new(),
     };
+    let targets: Vec<String> = target_ids.iter().map(|id| id.to_string()).collect();
     match rag.sidecar.health().await {
         Ok(sidecar) => Json(serde_json::json!({
             "success": true,
             "sidecar": sidecar,
             "peer_targets": targets,
             "own_root": rag.own_root().await,
+            "registry": rag.registry_status(&target_ids),
             "top_k": rag.config.top_k,
             "final_k": rag.config.final_k
         })).into_response(),
@@ -319,9 +321,7 @@ async fn rag_debug_hello(AxumState(state): AxumState<SharedState>) -> impl IntoR
     let Some(link) = state.network.read().await.rag_link().await else {
         return Json(serde_json::json!({ "success": true, "peers": [] })).into_response();
     };
-    let peers = futures::future::join_all(
-        link.targets.iter().map(|peer| rag.hello_peer(&link.endpoint, *peer))
-    ).await;
+    let peers = rag.refresh_peer_roots(&link).await;
     Json(serde_json::json!({ "success": true, "peers": peers })).into_response()
 }
 

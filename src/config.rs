@@ -216,6 +216,17 @@ pub struct RagConfig {
     pub generator_model: String,
     #[serde(default = "default_generator_url")]
     pub generator_url: String,
+    /// Timeout for fetching a peer's signed root (`hello`) and, later, for
+    /// round 1 of a query. Shorter than `peer_timeout_ms` because round 2 waits on it.
+    #[serde(default = "default_select_timeout_ms")]
+    pub select_timeout_ms: u64,
+    /// How often every peer's signed root is fetched again in the background.
+    #[serde(default = "default_root_refresh_secs")]
+    pub root_refresh_secs: u64,
+    /// A peer not heard from for this long is skipped at query time and left
+    /// to the background refresh. Peers never tried yet are always asked.
+    #[serde(default = "default_peer_stale_secs")]
+    pub peer_stale_secs: u64,
 }
 
 fn default_sidecar_port() -> u16 { 8600 }
@@ -227,6 +238,9 @@ fn default_max_message_bytes() -> usize { 1024 * 1024 }
 fn default_generator() -> String { "ollama".to_string() }
 fn default_generator_model() -> String { "qwen2.5:1.5b".to_string() }
 fn default_generator_url() -> String { "http://127.0.0.1:11434".to_string() }
+fn default_select_timeout_ms() -> u64 { 2000 }
+fn default_root_refresh_secs() -> u64 { 60 }
+fn default_peer_stale_secs() -> u64 { 180 }
 
 impl Default for RagConfig {
     fn default() -> Self {
@@ -244,6 +258,9 @@ impl Default for RagConfig {
             generator: default_generator(),
             generator_model: default_generator_model(),
             generator_url: default_generator_url(),
+            select_timeout_ms: default_select_timeout_ms(),
+            root_refresh_secs: default_root_refresh_secs(),
+            peer_stale_secs: default_peer_stale_secs(),
         }
     }
 }
@@ -279,6 +296,14 @@ impl Config {
         }
         if config.rag.generator != "ollama" && config.rag.generator != "none" {
             return Err("rag.generator must be \"ollama\" or \"none\"".into());
+        }
+        if config.rag.select_timeout_ms == 0
+            || config.rag.root_refresh_secs == 0
+            || config.rag.peer_stale_secs == 0
+        {
+            return Err(
+                "rag.select_timeout_ms, rag.root_refresh_secs and rag.peer_stale_secs must be positive".into()
+            );
         }
         Ok(config)
     }

@@ -244,3 +244,16 @@ On a stale-root refusal it signs the commitment the sidecar returned with its 40
 **J18. Keep `GET /rag/debug/hello` after the M4 check (Claude, 2026-10-18).**
 It fetches every peer target's signed root and reports whether each signature checks out against that peer's EndpointId.
 *Why:* the plan called it a temporary debug call, but it is the quickest way to confirm that machine 2 runs the new build and signs correctly before the two-machine run in M6. It can go once the registry in `/rag/status` (M5) shows the same information.
+
+**J19. Add `select_timeout_ms`, `root_refresh_secs` and `peer_stale_secs` in Phase M5 (Claude, 2026-10-18).**
+They are from the plan's section 7, which is otherwise done in M6, with the plan's defaults (2000 ms, 60 s, 180 s), serde defaults, and a check that each is positive.
+*Why:* the registry and its background refresh, built in M5, need them. Existing configs still load unchanged.
+
+**J20. Any answer from a peer counts as contact for stale-peer skipping, even one with a bad root (Claude, 2026-10-18).**
+*Why:* skipping is about not waiting on peers that are down. A peer that answers with a bad signature, a rollback or a conflicting root is clearly up; it is handled by its flags (and from M6 on, its chunks are refused), not by being treated as offline.
+
+**J21. Queries update the registry, and skipped peers are reported as `skipped_stale` from M5 on (Claude, 2026-10-18).**
+*Why:* the plan defines `last_ok` as the last successful hello *or query*, so query results must be recorded too. Reporting skipped peers in the `peers` list (a status value from section 6.4) shows why a peer gave no chunks.
+
+**J22. Registry details: rollbacks are flagged without evidence; equivocation compares signed fields; flags and evidence are not duplicated (Claude, 2026-10-18).**
+*Why:* the plan asks for evidence only for equivocation, where two signed roots with one version prove the peer lied. Ed25519 signatures are deterministic, so comparing the signed fields is the same as comparing roots, and is robust to how they are encoded. Without the de-duplication, a peer that keeps equivocating would grow the evidence list on every refresh.

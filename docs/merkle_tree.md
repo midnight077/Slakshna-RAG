@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M4 done (2026-10-18); M5–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M5 done (2026-10-18); M6–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -484,7 +484,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M2 — sidecar routes (done 2026-10-18; see section 14)
 - [x] Phase M3 — Rust verification library (done 2026-10-18; see section 14)
 - [x] Phase M4 — wire protocol v2 and own signed root (done 2026-10-18; see section 14)
-- [ ] Phase M5 — root registry and stale-peer skipping
+- [x] Phase M5 — root registry and stale-peer skipping (done 2026-10-18; see section 14)
 - [ ] Phase M6 — two-round query and flat mode
 - [ ] Phase M7 — simulated adversaries
 - [ ] Phase M8 — evaluation
@@ -576,3 +576,42 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J14–J
 - A failed request is answered with `kind: "error"` and the reason in `error`. `stale_root` is the one exception: it comes back as `kind: "chunks"` with the peer's current `root`. `request_peer` reports it as a typed `StaleRoot` error carrying that root.
 - The responder re-signs whenever the sidecar answers under a version it has not signed, for example after an ingest that bypassed the node. A stale-root refusal signs the commitment the sidecar returned with its 409.
 - `GET /rag/debug/hello` is kept rather than removed after the check, for the two-machine run in M6. `hello` uses `peer_timeout_ms` until `select_timeout_ms` exists (M6, config).
+
+### Phase M5 (2026-10-18, both nodes on machine 1)
+
+Done:
+- `src/rag/registry.rs`: `PeerRoot` and `RootRegistry`, with the accept rules from 6.1 (bad signature, rollback, equivocation with evidence, higher version) and target selection (`should_ask`).
+- The background task `run_root_refresh` (5 s after startup, then every `root_refresh_secs`) sends `hello` to every target with `select_timeout_ms`. It is started in `main.rs` after the network.
+- `/rag/query` skips peers the registry says are down and reports them as `skipped_stale`. Every query result also updates the registry.
+- `/rag/status` has a `registry` list.
+- New `[rag]` settings: `select_timeout_ms` (2000), `root_refresh_secs` (60), `peer_stale_secs` (180).
+
+Check (examples/rag-2node configs with `generator = "none"`; node 1 remembers and pins machine 2's node `313823…`, which is not running):
+
+| q07 asked of node 1 | `peer_retrieve` | Peers |
+| :-- | --: | :-- |
+| Right after startup, before the first refresh | 5001 ms | node 2 ok (410 ms, first connection); `313823…` timeout |
+| After the first refresh | 30 ms | node 2 ok; `313823…` `skipped_stale` |
+| Again | 23 ms | the same |
+
+`/rag/status` lists `313823…` with `status: "failing"`, `last_error: "hello timed out"` and `asked_in_queries: false`, and node 2 with `status: "ok"` and its accepted root and version.
+
+Recovery, with node 1 on short timers (`root_refresh_secs = 10`, `peer_stale_secs = 20`):
+
+| Time | Node 2 | `peer_retrieve` | Node 2's entry |
+| :-- | :-- | --: | :-- |
+| 0 s | up | 34 ms | ok |
+| 13 s | stopped at 1 s | 5001 ms | timeout (its last answer is still under 20 s old) |
+| 33 s | down | 0 ms | `skipped_stale`; answer from local chunks |
+| 37 s | restarted | 0 ms | `skipped_stale` (no refresh yet) |
+| 48 s | up | 27 ms | ok, after the next refresh |
+
+- `cargo test --release`: 25 tests pass (5 new registry tests). The Python tests pass. The build still has its 9 old warnings and no new ones. `rustfmt --check` is clean on `registry.rs`.
+
+Observed, worth deciding before M8: between a peer dying and `peer_stale_secs` passing, every query still waits out the full timeout. That is up to 3 minutes of 5 s queries with the defaults; in M6 round 1 the wait is `select_timeout_ms` (2 s). This is the rule in 6.1 as written. A stricter rule would also skip a peer whose latest contact failed, and the refresh would bring it back within `root_refresh_secs`. Not changed without the user's decision.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, J19–J22):
+- The three settings above come from section 7 and were added in M5 rather than M6, because the registry needs them. The other section-7 settings stay in M6.
+- `last_ok` counts any answer, including one with a bad, rolled-back or conflicting root. Reachability decides who is asked; trust is handled by the flags (checked from M6 on).
+- `skipped_stale` (from 6.4) is reported already.
+- A rollback is flagged without keeping evidence. Equivocation compares the signed fields, not the signature bytes. Each flag is listed once, and evidence is not duplicated.

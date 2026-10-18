@@ -30,8 +30,8 @@ bash setup.sh                                # Python deps, runtime dirs, releas
 
 cargo check                                  # fast validation of Rust changes
 cargo build --release                        # produces target/release/iiitd
-cargo test --release                         # Rust unit tests (identity.rs, rag/mod.rs, rag/merkle.rs incl. the shared Merkle fixture); --release reuses the built dependencies
-rustfmt --edition 2021 --check src/rag/merkle.rs # new Rust files only; existing files are not rustfmt-formatted (decision I5)
+cargo test --release                         # Rust unit tests (identity.rs, rag/mod.rs, rag/merkle.rs incl. the shared Merkle fixture, rag/protocol.rs, rag/registry.rs); --release reuses the built dependencies
+rustfmt --edition 2021 --check src/rag/merkle.rs src/rag/registry.rs   # new Rust files only; existing files are not rustfmt-formatted (decision I5)
 
 python -m unittest tests/test_delta_transport.py   # delta wire-format tests (needs torch)
 python ml_engine.py <my_id> <peer_id...>            # one ML epoch with no networking
@@ -79,7 +79,7 @@ Always run from the repository root: the node spawns `python ml_engine.py` with 
         └─────────────────────────┘
 ```
 
-The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running local HTTP service: PDF loading, chunking, embeddings, a FAISS index in `{data_dir}/rag/`, and answer generation through Ollama. When `[rag] enabled = true` the node launches it at startup (`src/rag/sidecar.rs`), and `src/rag/mod.rs` runs the query pipeline behind `POST /rag/query`, `POST /rag/ingest` and `GET /rag/status`. Peers are asked for chunks over a second Iroh protocol, `/slakshna/rag/2` (`src/rag/protocol.rs`; v1 builds can't talk to it): one QUIC stream per request, JSON request and response tagged by `kind` (`hello`, `centroids`, `chunks`, `search`), sent to every live or remembered peer at once with a per-peer timeout. Each node signs its sidecar's Merkle root with its Iroh transport key and serves it in `hello`; what peers return carries proofs against that root (`src/rag/merkle.rs`, plan in `docs/merkle_tree.md`). A peer that is down or runs a build without RAG is reported in the response's `peers` list and skipped.
+The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running local HTTP service: PDF loading, chunking, embeddings, a FAISS index in `{data_dir}/rag/`, and answer generation through Ollama. When `[rag] enabled = true` the node launches it at startup (`src/rag/sidecar.rs`), and `src/rag/mod.rs` runs the query pipeline behind `POST /rag/query`, `POST /rag/ingest` and `GET /rag/status`. Peers are asked for chunks over a second Iroh protocol, `/slakshna/rag/2` (`src/rag/protocol.rs`; v1 builds can't talk to it): one QUIC stream per request, JSON request and response tagged by `kind` (`hello`, `centroids`, `chunks`, `search`), sent to every live or remembered peer at once with a per-peer timeout. Each node signs its sidecar's Merkle root with its Iroh transport key and serves it in `hello`; what peers return carries proofs against that root (`src/rag/merkle.rs`, plan in `docs/merkle_tree.md`). A peer that is down or runs a build without RAG is reported in the response's `peers` list and skipped. A background task (`run_root_refresh`, every `root_refresh_secs`) fetches every peer's signed root into an in-memory registry (`src/rag/registry.rs`, shown in `/rag/status`); peers that haven't answered for `peer_stale_secs` are reported as `skipped_stale` instead of costing a timeout per query.
 
 ### One epoch (`src/main.rs`)
 

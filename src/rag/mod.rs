@@ -6,16 +6,19 @@
 
 pub mod merkle;
 pub mod protocol;
+pub mod registry;
 pub mod sidecar;
 
 use crate::config::RagConfig;
 use crate::history::BoxError;
 use merkle::{ Commitment, SignedRoot };
 use protocol::{ RagRequest, RequestBody, ResponseBody };
+use registry::{ PeerRootStatus, RootOutcome, RootRegistry };
 use serde::{ Deserialize, Serialize };
 use sha2::{ Digest, Sha256 };
 use sidecar::SidecarClient;
 use std::collections::HashSet;
+use std::sync::{ Arc, Mutex, MutexGuard };
 use std::time::{ Duration, Instant };
 use tokio::sync::RwLock;
 use tracing::{ info, warn };
@@ -66,7 +69,8 @@ pub struct PeerLink {
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerResult {
     pub endpoint_id: String,
-    /// "ok", "timeout" or "error".
+    /// "ok", "timeout", "error", or "skipped_stale" (not asked: it has not
+    /// answered for `peer_stale_secs`).
     pub status: String,
     pub chunks: usize,
     pub rtt_ms: u64,
@@ -87,8 +91,23 @@ pub struct PeerHello {
     pub root: Option<SignedRoot>,
     /// Whether `root` is signed by the key behind `endpoint_id`.
     pub signature_valid: bool,
+    /// What the root registry made of `root`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RootOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl PeerResult {
+    fn skipped_stale(peer: iroh::EndpointId) -> Self {
+        PeerResult {
+            endpoint_id: peer.to_string(),
+            status: "skipped_stale".to_string(),
+            chunks: 0,
+            rtt_ms: 0,
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -135,11 +154,31 @@ pub struct RagService {
     secret_key: iroh::SecretKey,
     /// Our latest signed Merkle root, served to peers in `hello`.
     own_root: RwLock<Option<SignedRoot>>,
+    /// Peers' signed roots and when each peer last answered.
+    registry: Mutex<RootRegistry>,
 }
 
 impl RagService {
     pub fn new(config: RagConfig, sidecar: SidecarClient, node_id: String, secret_key: iroh::SecretKey) -> Self {
-        RagService { config, sidecar, node_id, secret_key, own_root: RwLock::new(None) }
+        RagService {
+            config,
+            sidecar,
+            node_id,
+            secret_key,
+            own_root: RwLock::new(None),
+            registry: Mutex::new(RootRegistry::default()),
+        }
+    }
+
+    /// The root registry. Never hold the guard across an `.await`.
+    fn registry(&self) -> MutexGuard<'_, RootRegistry> {
+        // A panic while holding the lock leaves the data usable; keep going.
+        self.registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The registry's view of every peer, for `GET /rag/status`.
+    pub fn registry_status(&self, targets: &[iroh::EndpointId]) -> Vec<PeerRootStatus> {
+        self.registry().status(targets, Instant::now(), Duration::from_secs(self.config.peer_stale_secs))
     }
 
     pub fn node_id(&self) -> &str {
@@ -192,13 +231,14 @@ impl RagService {
         }
     }
 
-    /// Fetch one peer's signed root and check its signature against the
-    /// peer's EndpointId. Never fails; problems are reported in the result.
+    /// Fetch one peer's signed root, check its signature against the peer's
+    /// EndpointId, and record it in the registry. Never fails; problems are
+    /// reported in the result.
     pub async fn hello_peer(&self, endpoint: &iroh::Endpoint, peer: iroh::EndpointId) -> PeerHello {
         let started = Instant::now();
         let request = RagRequest::new(RequestBody::Hello);
         let outcome = tokio::time::timeout(
-            Duration::from_millis(self.config.peer_timeout_ms),
+            Duration::from_millis(self.config.select_timeout_ms),
             protocol::request_peer(endpoint, peer, &request, self.config.max_message_bytes),
         ).await;
 
@@ -209,23 +249,47 @@ impl RagService {
             node_id: None,
             root: None,
             signature_valid: false,
+            outcome: None,
             error: None,
         };
+        let now = Instant::now();
         match outcome {
             Ok(Ok(response)) => {
                 result.node_id = Some(response.node_id);
                 if let ResponseBody::Hello { root } = response.body {
                     result.signature_valid = root.verify(&peer);
+                    let outcome = self.registry().record_root(peer, root.clone(), now);
+                    match outcome {
+                        RootOutcome::Accepted => info!(
+                            "📜 Accepted RAG root {:.16}… (version {}) from peer {}",
+                            root.root,
+                            root.version,
+                            peer.fmt_short()
+                        ),
+                        RootOutcome::Unchanged => {}
+                        flagged => warn!("🚩 Peer {} sent a root flagged {:?}", peer.fmt_short(), flagged),
+                    }
+                    result.outcome = Some(outcome);
                     result.root = Some(root);
                 }
             }
             Ok(Err(e)) => {
                 result.status = "error".to_string();
                 result.error = Some(e.to_string());
+                self.registry().record_failure(peer, e.to_string(), now);
             }
-            Err(_) => result.status = "timeout".to_string(),
+            Err(_) => {
+                result.status = "timeout".to_string();
+                self.registry().record_failure(peer, "hello timed out".to_string(), now);
+            }
         }
         result
+    }
+
+    /// Fetch every target's signed root at once. Run in the background by
+    /// `run_root_refresh`, and by `GET /rag/debug/hello`.
+    pub async fn refresh_peer_roots(&self, link: &PeerLink) -> Vec<PeerHello> {
+        futures::future::join_all(link.targets.iter().map(|peer| self.hello_peer(&link.endpoint, *peer))).await
     }
 
     /// Ask one peer for chunks, bounded by `peer_timeout_ms`. Never fails: a
@@ -269,6 +333,12 @@ impl RagService {
             Ok(Err(e)) => ("error", Some(e.to_string()), Vec::new()),
             Err(_) => ("timeout", None, Vec::new()),
         };
+
+        let now = Instant::now();
+        match status {
+            "ok" => self.registry().record_ok(peer, now),
+            _ => self.registry().record_failure(peer, error.clone().unwrap_or_else(|| "query timed out".to_string()), now),
+        }
 
         let result = PeerResult {
             endpoint_id: peer.to_string(),
@@ -315,16 +385,21 @@ impl RagService {
 
         let remote = async {
             let peers_started = Instant::now();
-            let outcomes = match &link {
-                Some(link) if request.scope != Scope::Local => {
-                    futures::future::join_all(
-                        link.targets
-                            .iter()
-                            .map(|peer| self.ask_peer(&link.endpoint, *peer, &request.query, top_k)),
-                    ).await
-                }
-                _ => Vec::new(),
-            };
+            let mut outcomes = Vec::new();
+            if let Some(link) = link.as_ref().filter(|_| request.scope != Scope::Local) {
+                // Skip peers that are known to be down: each would cost the
+                // whole peer timeout. The background refresh brings them back.
+                let (asked, skipped): (Vec<&iroh::EndpointId>, Vec<&iroh::EndpointId>) = {
+                    let registry = self.registry();
+                    let stale = Duration::from_secs(self.config.peer_stale_secs);
+                    let now = Instant::now();
+                    link.targets.iter().partition(|peer| registry.should_ask(peer, now, stale))
+                };
+                outcomes = futures::future::join_all(
+                    asked.iter().map(|peer| self.ask_peer(&link.endpoint, **peer, &request.query, top_k)),
+                ).await;
+                outcomes.extend(skipped.iter().map(|peer| (PeerResult::skipped_stale(**peer), Vec::new())));
+            }
             (outcomes, peers_started.elapsed().as_millis() as u64)
         };
 
@@ -360,6 +435,24 @@ impl RagService {
                 total: started.elapsed().as_millis() as u64,
             },
         })
+    }
+}
+
+/// Fetch every peer's signed root 5 s after startup and then every
+/// `root_refresh_secs`, so the registry knows who is up before queries arrive.
+pub async fn run_root_refresh(
+    service: Arc<RagService>,
+    network: Arc<RwLock<crate::network::mesh::MeshNetwork>>,
+) {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    loop {
+        let link = network.read().await.rag_link().await;
+        if let Some(link) = link {
+            let results = service.refresh_peer_roots(&link).await;
+            let ok = results.iter().filter(|r| r.status == "ok").count();
+            tracing::debug!("Refreshed RAG roots: {} of {} peers answered", ok, results.len());
+        }
+        tokio::time::sleep(Duration::from_secs(service.config.root_refresh_secs)).await;
     }
 }
 
