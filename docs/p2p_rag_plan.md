@@ -32,7 +32,7 @@ It starts with 2 nodes on 2 CPU machines and must grow to 4, 6, 8 nodes without 
 
 Gossip floods a message to the whole swarm. Using it for RAG would send every query and every returned chunk to every node, and replies would have to be matched to requests by hand.
 
-Iroh lets one endpoint serve several protocols, each identified by a name called an ALPN. The plan adds a second protocol, `/slakshna/rag/1`, next to gossip:
+Iroh lets one endpoint serve several protocols, each identified by a name called an ALPN. The plan adds a second protocol, `/slakshna/rag/1`, next to gossip. (Since 2026-10-18 it is `/slakshna/rag/2`, with signed roots and proofs; see `merkle_tree.md`, section 5.)
 
 - the asking node opens a direct QUIC connection to each peer and one two-way stream per query;
 - it writes the request, the peer writes the response on the same stream;

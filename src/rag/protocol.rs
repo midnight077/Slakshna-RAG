@@ -4,7 +4,15 @@
 //! asker opens a QUIC connection and one two-way stream, writes a JSON
 //! `RagRequest`, and reads a JSON `RagResponse` back. Unlike gossip, only the
 //! two nodes involved see the query and the chunks.
+//!
+//! Version 2 (`docs/merkle_tree.md`, section 5) has four kinds of request:
+//! `hello` fetches the peer's signed Merkle root, `centroids` and `chunks` are
+//! the two rounds of a cluster-routed query, and `search` is the flat
+//! one-round query. Everything a peer returns comes with proofs against its
+//! signed root.
 
+use super::merkle::{ ClusterEntry, ProofStep, SignedRoot };
+use super::sidecar::ClusterSearch;
 use super::{ Chunk, RagService };
 use crate::history::BoxError;
 use iroh::endpoint::Connection;
@@ -18,30 +26,169 @@ use tracing::{ info, warn };
 /// Protocol identifier. Bump the trailing number on any incompatible change to
 /// the request or response, so mismatched builds refuse to connect instead of
 /// misreading each other.
-pub const RAG_ALPN: &[u8] = b"/slakshna/rag/1";
+pub const RAG_ALPN: &[u8] = b"/slakshna/rag/2";
 
-const WIRE_VERSION: u32 = 1;
-/// Upper bound on chunks a peer will return, whatever the asker requests.
+pub const WIRE_VERSION: u32 = 2;
+/// Upper bounds a peer applies, whatever the asker requests.
 const MAX_TOP_K: usize = 50;
+const MAX_CENTROIDS: usize = 10;
+const MAX_CLUSTERS: usize = 10;
+const MAX_PER_CLUSTER: usize = 10;
 
-#[derive(Debug, Serialize, Deserialize)]
+/// One request: common fields plus one of the four kinds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagRequest {
     pub v: u32,
     pub query_id: String,
-    pub query: String,
-    pub top_k: usize,
+    #[serde(flatten)]
+    pub body: RequestBody,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestBody {
+    /// Fetch the peer's signed root.
+    Hello,
+    /// Round 1: the peer's `n` clusters nearest to `query`.
+    Centroids {
+        query: String,
+        n: usize,
+    },
+    /// Round 2: the best `per_cluster` chunks of each listed cluster, under
+    /// the root version the clusters were chosen from.
+    Chunks {
+        query: String,
+        root_version: u64,
+        clusters: Vec<u32>,
+        per_cluster: usize,
+    },
+    /// Flat mode: the peer's best `top_k` chunks overall.
+    Search {
+        query: String,
+        top_k: usize,
+    },
+}
+
+impl RequestBody {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RequestBody::Hello => "hello",
+            RequestBody::Centroids { .. } => "centroids",
+            RequestBody::Chunks { .. } => "chunks",
+            RequestBody::Search { .. } => "search",
+        }
+    }
+}
+
+impl RagRequest {
+    pub fn new(body: RequestBody) -> Self {
+        RagRequest {
+            v: WIRE_VERSION,
+            query_id: uuid::Uuid::new_v4().to_string(),
+            body,
+        }
+    }
+}
+
+/// A chunk as it travels between peers: with its cluster and the proof that
+/// leads from it to that cluster's subtree root. Only used on the wire; once
+/// checked it becomes a plain `Chunk`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenChunk {
+    pub chunk_id: String,
+    pub source: String,
+    pub text: String,
+    pub score: f64,
+    pub cluster_id: u32,
+    pub chunk_proof: Vec<ProofStep>,
+}
+
+impl ProvenChunk {
+    pub fn into_chunk(self, node_id: &str) -> Chunk {
+        Chunk {
+            chunk_id: self.chunk_id,
+            source: self.source,
+            text: self.text,
+            score: self.score,
+            node_id: Some(node_id.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagResponse {
     pub v: u32,
     pub query_id: String,
     pub node_id: String,
     pub embedding_model: String,
-    pub chunks: Vec<Chunk>,
-    pub retrieve_ms: u64,
     pub error: Option<String>,
+    #[serde(flatten)]
+    pub body: ResponseBody,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResponseBody {
+    Hello {
+        root: SignedRoot,
+    },
+    Centroids {
+        root_version: u64,
+        centroids: Vec<ClusterEntry>,
+        retrieve_ms: u64,
+    },
+    Chunks {
+        root_version: u64,
+        clusters: Vec<ClusterEntry>,
+        chunks: Vec<ProvenChunk>,
+        retrieve_ms: u64,
+        /// Set with `error: "stale_root"`: the peer's current signed root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<SignedRoot>,
+    },
+    Search {
+        root_version: u64,
+        clusters: Vec<ClusterEntry>,
+        chunks: Vec<ProvenChunk>,
+        retrieve_ms: u64,
+    },
+    /// The request failed; `error` says why.
+    Error,
+}
+
+impl ResponseBody {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ResponseBody::Hello { .. } => "hello",
+            ResponseBody::Centroids { .. } => "centroids",
+            ResponseBody::Chunks { .. } => "chunks",
+            ResponseBody::Search { .. } => "search",
+            ResponseBody::Error => "error",
+        }
+    }
+
+    /// How many items this response carries, for the log.
+    fn item_count(&self) -> usize {
+        match self {
+            ResponseBody::Hello { .. } | ResponseBody::Error => 0,
+            ResponseBody::Centroids { centroids, .. } => centroids.len(),
+            ResponseBody::Chunks { chunks, .. } | ResponseBody::Search { chunks, .. } => chunks.len(),
+        }
+    }
+}
+
+/// A `chunks` request named a root version the peer no longer serves. Carries
+/// the peer's current signed root, so the asker can update what it knows.
+#[derive(Debug)]
+pub struct StaleRoot(pub SignedRoot);
+
+impl std::fmt::Display for StaleRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "peer's root has moved on to version {}", self.0.version)
+    }
+}
+
+impl std::error::Error for StaleRoot {}
 
 /// The answering side: serves this node's index to peers.
 pub struct RagProtocol {
@@ -61,15 +208,13 @@ impl RagProtocol {
     }
 
     async fn answer(&self, request_bytes: &[u8]) -> RagResponse {
-        let started = Instant::now();
         let mut response = RagResponse {
             v: WIRE_VERSION,
             query_id: String::new(),
             node_id: self.service.node_id().to_string(),
             embedding_model: self.service.config.embedding_model.clone(),
-            chunks: Vec::new(),
-            retrieve_ms: 0,
             error: None,
+            body: ResponseBody::Error,
         };
 
         let request: RagRequest = match serde_json::from_slice(request_bytes) {
@@ -85,12 +230,89 @@ impl RagProtocol {
             return response;
         }
 
-        match self.service.retrieve_local(&request.query, request.top_k.min(MAX_TOP_K)).await {
-            Ok(chunks) => response.chunks = chunks,
-            Err(e) => response.error = Some(format!("retrieval failed: {}", e)),
+        match self.respond(request.body).await {
+            Ok((body, error)) => {
+                response.body = body;
+                response.error = error;
+            }
+            Err(e) => response.error = Some(e.to_string()),
         }
-        response.retrieve_ms = started.elapsed().as_millis() as u64;
         response
+    }
+
+    /// Serve one request from the local sidecar. Returns the body, plus an
+    /// error string for answers that are refusals but still carry data
+    /// (`stale_root`).
+    async fn respond(&self, body: RequestBody) -> Result<(ResponseBody, Option<String>), BoxError> {
+        let started = Instant::now();
+        let service = &self.service;
+        let elapsed_ms = || started.elapsed().as_millis() as u64;
+
+        match body {
+            RequestBody::Hello => Ok((ResponseBody::Hello { root: service.current_root().await? }, None)),
+            RequestBody::Centroids { query, n } => {
+                let result = service.sidecar.centroids(&query, n.min(MAX_CENTROIDS)).await?;
+                service.ensure_root_version(result.root_version).await;
+                Ok((
+                    ResponseBody::Centroids {
+                        root_version: result.root_version,
+                        centroids: result.centroids,
+                        retrieve_ms: elapsed_ms(),
+                    },
+                    None,
+                ))
+            }
+            RequestBody::Chunks { query, root_version, mut clusters, per_cluster } => {
+                clusters.truncate(MAX_CLUSTERS);
+                let search = service.sidecar.search_clusters(
+                    &query,
+                    root_version,
+                    &clusters,
+                    per_cluster.min(MAX_PER_CLUSTER),
+                ).await?;
+                match search {
+                    ClusterSearch::Found(result) => {
+                        service.ensure_root_version(result.root_version).await;
+                        Ok((
+                            ResponseBody::Chunks {
+                                root_version: result.root_version,
+                                clusters: result.clusters,
+                                chunks: result.chunks,
+                                retrieve_ms: elapsed_ms(),
+                                root: None,
+                            },
+                            None,
+                        ))
+                    }
+                    ClusterSearch::StaleRoot(commitment) => {
+                        let root = service.adopt_commitment(&commitment).await?;
+                        Ok((
+                            ResponseBody::Chunks {
+                                root_version: root.version,
+                                clusters: Vec::new(),
+                                chunks: Vec::new(),
+                                retrieve_ms: elapsed_ms(),
+                                root: Some(root),
+                            },
+                            Some("stale_root".to_string()),
+                        ))
+                    }
+                }
+            }
+            RequestBody::Search { query, top_k } => {
+                let result = service.sidecar.retrieve_with_proofs(&query, top_k.min(MAX_TOP_K)).await?;
+                service.ensure_root_version(result.root_version).await;
+                Ok((
+                    ResponseBody::Search {
+                        root_version: result.root_version,
+                        clusters: result.clusters,
+                        chunks: result.chunks,
+                        retrieve_ms: elapsed_ms(),
+                    },
+                    None,
+                ))
+            }
+        }
     }
 }
 
@@ -112,13 +334,18 @@ impl ProtocolHandler for RagProtocol {
             .await
             .map_err(AcceptError::from_err)?;
 
+        let started = Instant::now();
         let response = self.answer(&request_bytes).await;
-        info!(
-            "📚 RAG query from peer {}: returned {} chunk(s) in {} ms",
-            remote.fmt_short(),
-            response.chunks.len(),
-            response.retrieve_ms
-        );
+        match &response.error {
+            None => info!(
+                "📚 RAG {} request from peer {}: returned {} item(s) in {} ms",
+                response.body.kind(),
+                remote.fmt_short(),
+                response.body.item_count(),
+                started.elapsed().as_millis()
+            ),
+            Some(error) => warn!("📚 RAG request from peer {} failed: {}", remote.fmt_short(), error),
+        }
 
         let response_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
         send.write_all(&response_bytes).await.map_err(AcceptError::from_err)?;
@@ -130,34 +357,171 @@ impl ProtocolHandler for RagProtocol {
     }
 }
 
-/// The asking side: fetch `top_k` chunks for `query` from one peer.
-pub async fn query_peer(
+/// The asking side: send one request to one peer and read its response.
+///
+/// Fails if the peer reports an error, answers another query, or answers with
+/// a different kind. A `stale_root` refusal fails with a `StaleRoot` error
+/// (find it with `downcast_ref`), which carries the peer's current root.
+pub async fn request_peer(
     endpoint: &Endpoint,
     peer: EndpointId,
-    query: &str,
-    top_k: usize,
+    request: &RagRequest,
     max_message_bytes: usize,
 ) -> Result<RagResponse, BoxError> {
-    let request = RagRequest {
-        v: WIRE_VERSION,
-        query_id: uuid::Uuid::new_v4().to_string(),
-        query: query.to_string(),
-        top_k,
-    };
-
     let connection = endpoint.connect(peer, RAG_ALPN).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    send.write_all(&serde_json::to_vec(&request)?).await?;
+    send.write_all(&serde_json::to_vec(request)?).await?;
     send.finish()?;
     let response_bytes = recv.read_to_end(max_message_bytes).await?;
     connection.close(0u32.into(), b"done");
 
     let response: RagResponse = serde_json::from_slice(&response_bytes)?;
-    if let Some(error) = response.error {
-        return Err(format!("peer reported: {}", error).into());
-    }
-    if response.query_id != request.query_id {
+    check_response(request, response)
+}
+
+fn check_response(request: &RagRequest, response: RagResponse) -> Result<RagResponse, BoxError> {
+    if response.query_id != request.query_id && response.error.is_none() {
         return Err("peer answered a different query".into());
     }
+    match response.error.as_deref() {
+        None => {}
+        Some("stale_root") => {
+            return match response.body {
+                ResponseBody::Chunks { root: Some(root), .. } => Err(Box::new(StaleRoot(root))),
+                _ => Err("peer reported stale_root without its current root".into()),
+            };
+        }
+        Some(error) => {
+            return Err(format!("peer reported: {}", error).into());
+        }
+    }
+    if response.body.kind() != request.body.kind() {
+        return Err(
+            format!(
+                "peer answered a {} request with {}",
+                request.body.kind(),
+                response.body.kind()
+            ).into()
+        );
+    }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn signed_root() -> SignedRoot {
+        SignedRoot {
+            root: "ab".repeat(32),
+            version: 1792328689018,
+            num_chunks: 161,
+            num_clusters: 13,
+            dim: 384,
+            embedding_model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            signature: "cd".repeat(64),
+        }
+    }
+
+    fn response(query_id: &str, error: Option<&str>, body: ResponseBody) -> RagResponse {
+        RagResponse {
+            v: WIRE_VERSION,
+            query_id: query_id.to_string(),
+            node_id: "slakshna1peer".to_string(),
+            embedding_model: "m".to_string(),
+            error: error.map(str::to_string),
+            body,
+        }
+    }
+
+    #[test]
+    fn requests_match_the_documented_json() {
+        // The shapes from docs/merkle_tree.md, section 5.
+        let cases = [
+            (RequestBody::Hello, json!({"v": 2, "kind": "hello", "query_id": "q"})),
+            (
+                RequestBody::Centroids { query: "x".into(), n: 3 },
+                json!({"v": 2, "kind": "centroids", "query_id": "q", "query": "x", "n": 3}),
+            ),
+            (
+                RequestBody::Chunks { query: "x".into(), root_version: 7, clusters: vec![4, 7], per_cluster: 3 },
+                json!({"v": 2, "kind": "chunks", "query_id": "q", "query": "x", "root_version": 7,
+                       "clusters": [4, 7], "per_cluster": 3}),
+            ),
+            (
+                RequestBody::Search { query: "x".into(), top_k: 5 },
+                json!({"v": 2, "kind": "search", "query_id": "q", "query": "x", "top_k": 5}),
+            ),
+        ];
+        for (body, expected) in cases {
+            let request = RagRequest { v: 2, query_id: "q".into(), body: body.clone() };
+            assert_eq!(serde_json::to_value(&request).unwrap(), expected);
+            let parsed: RagRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(parsed.body, body);
+        }
+    }
+
+    #[test]
+    fn responses_round_trip_with_large_versions() {
+        let hello = response("q", None, ResponseBody::Hello { root: signed_root() });
+        let value = serde_json::to_value(&hello).unwrap();
+        assert_eq!(value["kind"], "hello");
+        assert_eq!(value["error"], serde_json::Value::Null);
+        assert_eq!(value["root"]["version"], 1792328689018u64);
+        let parsed: RagResponse = serde_json::from_value(value).unwrap();
+        assert!(matches!(parsed.body, ResponseBody::Hello { root } if root == signed_root()));
+
+        let chunks = response("q", None, ResponseBody::Chunks {
+            root_version: u64::MAX,
+            clusters: Vec::new(),
+            chunks: Vec::new(),
+            retrieve_ms: 3,
+            root: None,
+        });
+        let value = serde_json::to_value(&chunks).unwrap();
+        assert!(value.get("root").is_none());
+        let parsed: RagResponse = serde_json::from_value(value).unwrap();
+        assert!(matches!(parsed.body, ResponseBody::Chunks { root_version: u64::MAX, .. }));
+    }
+
+    #[test]
+    fn check_response_accepts_matching_kind_and_id() {
+        let request = RagRequest::new(RequestBody::Hello);
+        let ok = response(&request.query_id, None, ResponseBody::Hello { root: signed_root() });
+        assert!(check_response(&request, ok).is_ok());
+    }
+
+    #[test]
+    fn check_response_rejects_mismatches_and_errors() {
+        let request = RagRequest::new(RequestBody::Hello);
+        let other_id = response("other", None, ResponseBody::Hello { root: signed_root() });
+        assert!(check_response(&request, other_id).unwrap_err().to_string().contains("different query"));
+
+        let wrong_kind = response(&request.query_id, None, ResponseBody::Error);
+        assert!(check_response(&request, wrong_kind).unwrap_err().to_string().contains("with error"));
+
+        let failed = response("", Some("malformed request: x"), ResponseBody::Error);
+        assert!(check_response(&request, failed).unwrap_err().to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn stale_root_carries_the_peers_current_root() {
+        let request = RagRequest::new(RequestBody::Chunks {
+            query: "x".into(),
+            root_version: 1,
+            clusters: vec![0],
+            per_cluster: 3,
+        });
+        let stale = response(&request.query_id, Some("stale_root"), ResponseBody::Chunks {
+            root_version: signed_root().version,
+            clusters: Vec::new(),
+            chunks: Vec::new(),
+            retrieve_ms: 1,
+            root: Some(signed_root()),
+        });
+        let error = check_response(&request, stale).unwrap_err();
+        let StaleRoot(root) = error.downcast_ref::<StaleRoot>().expect("a StaleRoot error");
+        assert_eq!(*root, signed_root());
+    }
 }

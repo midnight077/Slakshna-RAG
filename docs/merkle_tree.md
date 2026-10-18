@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M3 done (2026-10-18); M4–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M4 done (2026-10-18); M5–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -483,7 +483,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M1 — clustering and Merkle tree in the store (done 2026-10-18; see section 14)
 - [x] Phase M2 — sidecar routes (done 2026-10-18; see section 14)
 - [x] Phase M3 — Rust verification library (done 2026-10-18; see section 14)
-- [ ] Phase M4 — wire protocol v2 and own signed root
+- [x] Phase M4 — wire protocol v2 and own signed root (done 2026-10-18; see section 14)
 - [ ] Phase M5 — root registry and stale-peer skipping
 - [ ] Phase M6 — two-round query and flat mode
 - [ ] Phase M7 — simulated adversaries
@@ -549,3 +549,30 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J12–J
 - `SignedRoot::message_bytes` returns a `Result`, because `root` is a hex string in JSON and may not be valid. The byte layout is in a free function, `root_message(...)`, which the fixture test calls directly.
 - A `Commitment` struct (the unsigned `/commitment` reply) is the input to `SignedRoot::sign`.
 - The module has `#![allow(dead_code)]` until the protocol uses it (M4/M6), so the build gains no warnings in the meantime.
+
+### Phase M4 (2026-10-18, both nodes on machine 1)
+
+Done:
+- `src/rag/protocol.rs` speaks v2 (`/slakshna/rag/2`). Requests and responses are tagged by `kind`, and the responder serves `hello`, `centroids`, `chunks` and `search` from its sidecar, with the caps from section 5. `request_peer` replaces `query_peer`.
+- `RagService` holds the transport key and `own_root`, and gains `refresh_own_root`. `main.rs` signs the root after the startup ingest and before the network starts, and `/rag/ingest` re-signs.
+- `Keypair::transport_secret_key()` in `src/identity.rs` is the shared helper, used by both `mesh.rs` and `main.rs`.
+- Sidecar client methods for `/commitment`, `/centroids`, `/search_clusters` (with 409 → stale root) and `/retrieve` with proofs.
+- `GET /rag/status` shows `own_root`. A new `GET /rag/debug/hello` fetches every peer's root and checks its signature.
+
+Check (examples/rag-2node configs with `generator = "none"`, real `data-rag-node1/2` folders):
+- Both nodes signed their root before the network came up: node 1 `802f7d37…` (161 chunks, 13 clusters), node 2 `5172ade3…` (174 chunks, 13 clusters). These are the same roots M1 got from copies of these indexes. On this first start the real indexes were migrated in place.
+- Node 1's `/rag/status` shows `own_root`, equal to its sidecar's commitment.
+- `hello` from node 1 to node 2 (`dd0020…`) returned node 2's root at its current version with `signature_valid = true`, in 3–4 ms. The reverse direction also worked.
+- An independent check with Python's `cryptography` package rebuilt the message bytes from section 2.4. Both signatures verify against their own EndpointId and fail against the other node's key or with `version + 1`.
+- Re-signing: node 2 was restarted on a scratch copy of its data folder (same identity; same root after the restart). One document was ingested through `/rag/ingest`, giving version 1792345228347 and root `768db7ea…`. Node 2 logged the new signed root at once, and node 1's next `hello` got it with a valid signature.
+- `/rag/query` on node 1 for q07 (a `node2_only` question) still works over v2 `search`: 5 contexts, all from node 2, containing the answer. Peer round trip 30 ms.
+- `cargo test --release`: 20 tests pass (5 new wire-format tests). The Python tests pass. The build has no new warnings.
+
+Notes:
+- Node 1 still pins machine 2's node (`313823…`), which was not running. Every `hello` and query waited the full 5001 ms for it. This is the stale-peer delay M5 fixes.
+- Until M6, `/rag/query` sends a `search` request and uses the returned chunks **without checking their proofs**, as v1 did. M6 adds the verification.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, J14–J18):
+- A failed request is answered with `kind: "error"` and the reason in `error`. `stale_root` is the one exception: it comes back as `kind: "chunks"` with the peer's current `root`. `request_peer` reports it as a typed `StaleRoot` error carrying that root.
+- The responder re-signs whenever the sidecar answers under a version it has not signed, for example after an ingest that bypassed the node. A stale-root refusal signs the commitment the sidecar returned with its 409.
+- `GET /rag/debug/hello` is kept rather than removed after the check, for the two-machine run in M6. `hello` uses `peer_timeout_ms` until `select_timeout_ms` exists (M6, config).

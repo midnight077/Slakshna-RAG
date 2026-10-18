@@ -226,3 +226,21 @@ The body is `{"detail": {"error": "stale_root", "root": {root, version, num_chun
 
 **J13. `src/rag/merkle.rs` allows unused code until the peer protocol uses it (Claude, 2026-10-18).**
 *Why:* in M3 only the tests call it. Without the allowance, the build would gain about a dozen "never used" warnings for one or two phases. Remove it once M4/M6 use the module.
+
+**J14. Until Phase M6, `/rag/query` uses the new `search` request without checking proofs (Claude, 2026-10-18).**
+*Why:* the protocol changed in M4, but the verifying query pipelines only come in M6. Sending the flat `search` and taking its chunks as v1 did keeps `/rag/query` working in between. B1's design (a dedicated Iroh protocol) is unchanged; only its version is now 2.
+
+**J15. Failed requests are answered with `kind: "error"`; `stale_root` comes back as a `chunks` answer carrying the current root (Claude, 2026-10-18).**
+`request_peer` turns a `stale_root` into a typed `StaleRoot` error that holds the peer's signed root.
+*Why:* a request that can't be read has no kind to echo, and an empty answer of the right kind would look like "no results". A stale root is different: the asker needs the new root to update its registry, so it gets its own type instead of an error string to parse.
+
+**J16. The responder re-signs whenever its sidecar answers under a version it has not signed (Claude, 2026-10-18).**
+On a stale-root refusal it signs the commitment the sidecar returned with its 409, instead of asking again.
+*Why:* an ingest can reach the sidecar without going through the node (for example `rag_engine.py ingest` run by hand). `hello` should never hand out a root older than the proofs the node is serving.
+
+**J17. The shared Iroh-key helper is `Keypair::transport_secret_key()` in `src/identity.rs` (Claude, 2026-10-18).**
+*Why:* the plan asked for one helper used by both the mesh and the RAG service. Putting it next to `transport_seed()`, on the keypair itself, means neither side can derive the key differently.
+
+**J18. Keep `GET /rag/debug/hello` after the M4 check (Claude, 2026-10-18).**
+It fetches every peer target's signed root and reports whether each signature checks out against that peer's EndpointId.
+*Why:* the plan called it a temporary debug call, but it is the quickest way to confirm that machine 2 runs the new build and signs correctly before the two-machine run in M6. It can go once the registry in `/rag/status` (M5) shows the same information.

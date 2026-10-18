@@ -112,7 +112,7 @@ impl MeshNetwork {
         let keypair = state
             .get_keypair()
             .ok_or_else(|| BoxError::from("node identity not loaded before starting the network"))?;
-        Ok(SecretKey::from_bytes(&keypair.transport_seed()))
+        Ok(keypair.transport_secret_key())
     }
 
     /// Seed peers to reach for on startup: whatever the config lists, plus every

@@ -55,6 +55,7 @@ pub async fn start_api_server(
         .route("/rag/query", post(rag_query))
         .route("/rag/ingest", post(rag_ingest))
         .route("/rag/status", get(rag_status))
+        .route("/rag/debug/hello", get(rag_debug_hello))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
@@ -281,7 +282,13 @@ async fn rag_ingest(
 ) -> impl IntoResponse {
     let Some(rag) = &state.rag else { return rag_disabled() };
     match rag.sidecar.ingest(&body).await {
-        Ok(result) => Json(result).into_response(),
+        Ok(result) => {
+            // New documents mean a new Merkle root; sign it before peers ask.
+            if let Err(e) = rag.refresh_own_root().await {
+                tracing::warn!("⚠️ Ingest succeeded but the new RAG root could not be signed: {}", e);
+            }
+            Json(result).into_response()
+        }
         Err(e) => rag_error(StatusCode::BAD_GATEWAY, "rag_failed", e.to_string()),
     }
 }
@@ -297,11 +304,25 @@ async fn rag_status(AxumState(state): AxumState<SharedState>) -> impl IntoRespon
             "success": true,
             "sidecar": sidecar,
             "peer_targets": targets,
+            "own_root": rag.own_root().await,
             "top_k": rag.config.top_k,
             "final_k": rag.config.final_k
         })).into_response(),
         Err(e) => rag_error(StatusCode::BAD_GATEWAY, "rag_failed", e.to_string()),
     }
+}
+
+/// Debugging aid: fetch every peer target's signed root and check each
+/// signature against that peer's EndpointId.
+async fn rag_debug_hello(AxumState(state): AxumState<SharedState>) -> impl IntoResponse {
+    let Some(rag) = &state.rag else { return rag_disabled() };
+    let Some(link) = state.network.read().await.rag_link().await else {
+        return Json(serde_json::json!({ "success": true, "peers": [] })).into_response();
+    };
+    let peers = futures::future::join_all(
+        link.targets.iter().map(|peer| rag.hello_peer(&link.endpoint, *peer))
+    ).await;
+    Json(serde_json::json!({ "success": true, "peers": peers })).into_response()
 }
 
 async fn ws_handler(

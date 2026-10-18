@@ -1,5 +1,7 @@
 //! Client for, and launcher of, the local Python RAG sidecar.
 
+use super::merkle::{ ClusterEntry, Commitment };
+use super::protocol::ProvenChunk;
 use super::Chunk;
 use crate::config::{ NodeConfig, RagConfig };
 use crate::history::BoxError;
@@ -25,6 +27,40 @@ pub struct GenerateResponse {
     pub answer: String,
 }
 
+/// Round 1 of a peer query: this node's clusters nearest to a query.
+#[derive(Debug, Deserialize)]
+pub struct CentroidsResponse {
+    pub root_version: u64,
+    pub centroids: Vec<ClusterEntry>,
+}
+
+/// Chunks with proofs, plus the entries of the clusters they belong to.
+#[derive(Debug, Deserialize)]
+pub struct ProvenChunks {
+    pub root_version: u64,
+    pub clusters: Vec<ClusterEntry>,
+    pub chunks: Vec<ProvenChunk>,
+}
+
+/// Result of `/search_clusters`. Cluster ids only mean something under one
+/// root, so the sidecar refuses a request made for another version.
+#[derive(Debug)]
+pub enum ClusterSearch {
+    Found(ProvenChunks),
+    /// The asker's version is not current; this is the commitment that is.
+    StaleRoot(Commitment),
+}
+
+/// Decode a sidecar reply, turning an HTTP error status into an error.
+async fn read_json<R: DeserializeOwned>(path: &str, response: reqwest::Response) -> Result<R, BoxError> {
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(format!("RAG sidecar {} returned {}: {}", path, status, detail).into());
+    }
+    Ok(response.json::<R>().await?)
+}
+
 #[derive(Clone)]
 pub struct SidecarClient {
     base_url: String,
@@ -39,12 +75,12 @@ impl SidecarClient {
         }
     }
 
-    async fn post<B: Serialize, R: DeserializeOwned>(
+    async fn send<B: Serialize>(
         &self,
         path: &str,
         body: &B,
         timeout: Duration,
-    ) -> Result<R, BoxError> {
+    ) -> Result<reqwest::Response, BoxError> {
         let response = self
             .http
             .post(format!("{}{}", self.base_url, path))
@@ -53,13 +89,17 @@ impl SidecarClient {
             .send()
             .await
             .map_err(|e| format!("RAG sidecar unreachable at {}: {}", self.base_url, e))?;
+        Ok(response)
+    }
 
-        let status = response.status();
-        if !status.is_success() {
-            let detail = response.text().await.unwrap_or_default();
-            return Err(format!("RAG sidecar {} returned {}: {}", path, status, detail).into());
-        }
-        Ok(response.json::<R>().await?)
+    async fn post<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<R, BoxError> {
+        let response = self.send(path, body, timeout).await?;
+        read_json(path, response).await
     }
 
     pub async fn health(&self) -> Result<serde_json::Value, BoxError> {
@@ -86,6 +126,63 @@ impl SidecarClient {
             "/generate",
             &serde_json::json!({ "query": query, "chunks": chunks }),
             GENERATE_TIMEOUT,
+        ).await
+    }
+
+    /// This node's unsigned Merkle commitment; the node signs it.
+    pub async fn commitment(&self) -> Result<Commitment, BoxError> {
+        let response = self
+            .http
+            .get(format!("{}/commitment", self.base_url))
+            .timeout(RETRIEVE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("RAG sidecar unreachable at {}: {}", self.base_url, e))?;
+        read_json("/commitment", response).await
+    }
+
+    pub async fn centroids(&self, query: &str, n: usize) -> Result<CentroidsResponse, BoxError> {
+        self.post(
+            "/centroids",
+            &serde_json::json!({ "query": query, "n": n }),
+            RETRIEVE_TIMEOUT,
+        ).await
+    }
+
+    pub async fn search_clusters(
+        &self,
+        query: &str,
+        root_version: u64,
+        clusters: &[u32],
+        per_cluster: usize,
+    ) -> Result<ClusterSearch, BoxError> {
+        let body = serde_json::json!({
+            "query": query,
+            "root_version": root_version,
+            "clusters": clusters,
+            "per_cluster": per_cluster,
+        });
+        let response = self.send("/search_clusters", &body, RETRIEVE_TIMEOUT).await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            #[derive(Deserialize)]
+            struct Stale {
+                root: Commitment,
+            }
+            #[derive(Deserialize)]
+            struct Conflict {
+                detail: Stale,
+            }
+            let conflict: Conflict = response.json().await?;
+            return Ok(ClusterSearch::StaleRoot(conflict.detail.root));
+        }
+        Ok(ClusterSearch::Found(read_json("/search_clusters", response).await?))
+    }
+
+    pub async fn retrieve_with_proofs(&self, query: &str, top_k: usize) -> Result<ProvenChunks, BoxError> {
+        self.post(
+            "/retrieve",
+            &serde_json::json!({ "query": query, "top_k": top_k, "with_proofs": true }),
+            RETRIEVE_TIMEOUT,
         ).await
     }
 

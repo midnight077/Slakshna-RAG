@@ -47,6 +47,7 @@ uv pip install --python .venv-rag/bin/python --torch-backend cpu -r requirements
 ./target/release/iiitd --config node1.toml   # run one node
 ./target/release/iiitd --config examples/rag-2node/node1.toml   # RAG node: no training, starts its own sidecar
 curl localhost:8545/rag/query -H 'content-type: application/json' -d '{"query": "..."}'
+curl localhost:8545/rag/debug/hello           # fetch every peer's signed RAG root and check its signature
 ./start_cluster.sh 2                         # 2, 4 or 6 local nodes from examples/<N>node/, logs in logs/
 ./stop_cluster.sh
 ```
@@ -78,7 +79,7 @@ Always run from the repository root: the node spawns `python ml_engine.py` with 
         └─────────────────────────┘
 ```
 
-The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running local HTTP service: PDF loading, chunking, embeddings, a FAISS index in `{data_dir}/rag/`, and answer generation through Ollama. When `[rag] enabled = true` the node launches it at startup (`src/rag/sidecar.rs`), and `src/rag/mod.rs` runs the query pipeline behind `POST /rag/query`, `POST /rag/ingest` and `GET /rag/status`. Peers are asked for chunks over a second Iroh protocol, `/slakshna/rag/1` (`src/rag/protocol.rs`): one QUIC stream per query, JSON request and response, sent to every live or remembered peer at once with a per-peer timeout. A peer that is down or runs a build without RAG is reported in the response's `peers` list and skipped.
+The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running local HTTP service: PDF loading, chunking, embeddings, a FAISS index in `{data_dir}/rag/`, and answer generation through Ollama. When `[rag] enabled = true` the node launches it at startup (`src/rag/sidecar.rs`), and `src/rag/mod.rs` runs the query pipeline behind `POST /rag/query`, `POST /rag/ingest` and `GET /rag/status`. Peers are asked for chunks over a second Iroh protocol, `/slakshna/rag/2` (`src/rag/protocol.rs`; v1 builds can't talk to it): one QUIC stream per request, JSON request and response tagged by `kind` (`hello`, `centroids`, `chunks`, `search`), sent to every live or remembered peer at once with a per-peer timeout. Each node signs its sidecar's Merkle root with its Iroh transport key and serves it in `hello`; what peers return carries proofs against that root (`src/rag/merkle.rs`, plan in `docs/merkle_tree.md`). A peer that is down or runs a build without RAG is reported in the response's `peers` list and skipped.
 
 ### One epoch (`src/main.rs`)
 

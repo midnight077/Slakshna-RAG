@@ -103,7 +103,21 @@ async fn main() -> Result<(), BoxError> {
             info!("📚 Ingested {}: {}", corpus_dir, result);
         }
         info!("📚 RAG sidecar ready: {}", client.health().await?);
-        let service = crate::rag::RagService::new(config.rag.clone(), client, config.node.id.clone());
+        // The root is signed with the Iroh transport key, so peers can check it
+        // against our EndpointId. Signing before the network starts means the
+        // first `hello` a peer sends already gets a root.
+        let transport_key = state
+            .read().await
+            .get_keypair()
+            .ok_or("node identity not loaded")?
+            .transport_secret_key();
+        let service = crate::rag::RagService::new(
+            config.rag.clone(),
+            client,
+            config.node.id.clone(),
+            transport_key
+        );
+        service.refresh_own_root().await?;
         (Some(Arc::new(service)), child)
     } else {
         (None, None)
