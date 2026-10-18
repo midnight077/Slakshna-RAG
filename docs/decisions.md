@@ -219,3 +219,10 @@ The body is `{"detail": {"error": "stale_root", "root": {root, version, num_chun
 **J11. Route tests run in-process with FastAPI's test client (Claude, 2026-10-18).**
 `tests/test_rag_server.py` uses the fake embedder from the store tests.
 *Why:* it checks every route, including the proofs, in about a second, with no model download, port or running server. `httpx`, which the test client needs, is already in `requirements-rag.txt`.
+
+**J12. In Rust, roots and hashes stay hex strings in the wire types and are parsed when checked (Claude, 2026-10-18).**
+`SignedRoot`, `ClusterEntry` and `ProofStep` hold hex `String`s, exactly like the JSON. Anything that needs bytes parses them and returns an error (or `false` from `verify`) if they are malformed. So `SignedRoot::message_bytes` returns a `Result`, and the byte layout lives in a separate `root_message(...)` function. `SignedRoot::sign` takes a `Commitment` struct, the unsigned reply of the sidecar's `GET /commitment`.
+*Why:* data from peers is untrusted, so bad hex must become a rejection, not a crash. Keeping the structs identical to the JSON means serde needs no custom code.
+
+**J13. `src/rag/merkle.rs` allows unused code until the peer protocol uses it (Claude, 2026-10-18).**
+*Why:* in M3 only the tests call it. Without the allowance, the build would gain about a dozen "never used" warnings for one or two phases. Remove it once M4/M6 use the module.

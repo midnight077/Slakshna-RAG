@@ -4,6 +4,7 @@
 //! local Python sidecar (`rag_engine.py`). This module is the node's side of
 //! that — the sidecar client and the query pipeline behind `POST /rag/query`.
 
+pub mod merkle;
 pub mod protocol;
 pub mod sidecar;
 

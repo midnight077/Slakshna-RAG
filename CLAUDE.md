@@ -30,8 +30,8 @@ bash setup.sh                                # Python deps, runtime dirs, releas
 
 cargo check                                  # fast validation of Rust changes
 cargo build --release                        # produces target/release/iiitd
-cargo test --release                         # Rust unit tests (identity.rs, rag/mod.rs); --release reuses the built dependencies
-rustfmt --check src/rag/merkle.rs                # new Rust files only; existing files are not rustfmt-formatted (decision I5)
+cargo test --release                         # Rust unit tests (identity.rs, rag/mod.rs, rag/merkle.rs incl. the shared Merkle fixture); --release reuses the built dependencies
+rustfmt --edition 2021 --check src/rag/merkle.rs # new Rust files only; existing files are not rustfmt-formatted (decision I5)
 
 python -m unittest tests/test_delta_transport.py   # delta wire-format tests (needs torch)
 python ml_engine.py <my_id> <peer_id...>            # one ML epoch with no networking

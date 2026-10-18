@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M2 done (2026-10-18); M3–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M3 done (2026-10-18); M4–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -482,7 +482,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 
 - [x] Phase M1 — clustering and Merkle tree in the store (done 2026-10-18; see section 14)
 - [x] Phase M2 — sidecar routes (done 2026-10-18; see section 14)
-- [ ] Phase M3 — Rust verification library
+- [x] Phase M3 — Rust verification library (done 2026-10-18; see section 14)
 - [ ] Phase M4 — wire protocol v2 and own signed root
 - [ ] Phase M5 — root registry and stale-peer skipping
 - [ ] Phase M6 — two-round query and flat mode
@@ -534,3 +534,18 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J9–J1
 - The store's lock is public (`store.lock`). Routes that report a `root_version` hold it while reading the version and the results, so the two always match. The query is embedded before the lock is taken.
 - The plan fixed the 409 body only for the peer protocol. On the sidecar it is `{"detail": {"error": "stale_root", "root": <commitment summary>}}`, so Rust can update its own view without a second request.
 - An unknown cluster id gets HTTP 400. A negative `n` or `per_cluster` gets 422 (FastAPI's validation error).
+
+### Phase M3 (2026-10-18, machine 1)
+
+Done: `src/rag/merkle.rs`, as in section 4. It has `ProofStep`, `leaf_hash`, `inner_hash`, `cluster_hash`, `fold_proof`, `ClusterEntry::verify`, `verify_chunk`, `SignedRoot` (`sign`, `verify`, `message_bytes`) and `dot`. It is registered in `src/rag/mod.rs`.
+
+Check:
+- `cargo test --release`: 15 tests pass, 9 of them new. The fixture tests check every leaf, inner and cluster hash, every tree root (Rust builds the trees again with a test-only builder), every proof, the centroid values, the edge cases (empty tree, 1 leaf, an odd node moving up, 1 cluster, empty corpus) and the signed-root message bytes. So Python and Rust agree byte for byte.
+- The tests catch format mistakes. With the leaf marker changed to `0x03`, 3 tests failed; with the length prefixes made little-endian, 4 failed. The file was restored afterwards.
+- Signing: a sign/verify round trip works, also after a JSON round trip. Verification fails for another key, a changed `version`, a changed `embedding_model`, a malformed signature and a malformed root.
+- `rustfmt --edition 2021 --check src/rag/merkle.rs` is clean. The release build still has the same 9 warnings it had before, none from `merkle.rs`. The Python tests still pass.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, J12–J13):
+- `SignedRoot::message_bytes` returns a `Result`, because `root` is a hex string in JSON and may not be valid. The byte layout is in a free function, `root_message(...)`, which the fixture test calls directly.
+- A `Commitment` struct (the unsigned `/commitment` reply) is the input to `SignedRoot::sign`.
+- The module has `#![allow(dead_code)]` until the protocol uses it (M4/M6), so the build gains no warnings in the meantime.
