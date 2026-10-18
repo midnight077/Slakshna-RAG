@@ -15,6 +15,8 @@ Related docs:
 
 - `docs/explanation.md` — plain-language walkthrough of the whole project (the user's preferred level of explanation).
 - `docs/p2p_rag_plan.md` — the implementation plan for the peer-to-peer RAG pipeline. **Read it before doing any RAG work** and keep its status checklist up to date.
+- `docs/decisions.md` — log of every design and working decision, with its reason. **Add an entry whenever you make or change a decision** (see "Recording decisions" below).
+- `docs/merkle_tree.md` — plan for verifiable, cluster-routed retrieval (k-means centroids, Merkle roots, two-round peer queries). **Read it before changing the RAG store or peer protocol** and keep its status checklist up to date.
 - `docs/AGENTS.md` — existing repository guidelines (style, commits, testing).
 - `docs/delta_wire_format.md` — the sparse int8 delta format.
 - `walkthrough280726.md` — step-by-step description of one training epoch inside `ml_engine.py`.
@@ -119,6 +121,16 @@ The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running loc
 - Commits use Conventional Commit prefixes (`feat:`, `docs:`, `refactor:`).
 - Runtime output (`data-node*/`, `logs/`, `ml_models/`, `ml_states/`, `hf_cache/`, `config_*.yaml`) is not source and must not be committed.
 - Changes inside `Bhaskera/` are committed and pushed in the submodule first (branch `Slakshna`), then the parent repo's pointer is updated.
+
+## Recording decisions
+
+Whenever you choose between real alternatives (a design, a library, a default value, a config, a test method, a workaround), or the user makes or changes a decision, add an entry to `docs/decisions.md` in the same piece of work:
+
+- put it in the matching section, numbered after the last entry there (add a section if none fits);
+- say what was decided, who decided it (User or Claude) and the date, and a plain-language *Why*;
+- when a decision changes, mark the old entry **Replaced** with a pointer to the new one instead of deleting it.
+
+Routine edits that follow an existing decision need no entry.
 
 ## Working with the user
 

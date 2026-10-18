@@ -1,6 +1,6 @@
 # Peer-to-Peer RAG on SLAKSHNA — Implementation Plan
 
-Status: **plan only, no code implemented.** Written 2026-10-11. The test corpus in `corpus/` exists.
+Written 2026-10-11. Status: Phases 0–4 implemented (see the checklist in section 10). Commands to run everything from scratch are in section 15. Decisions and their reasons are logged in `decisions.md`.
 
 ## 1. Goal
 
@@ -274,7 +274,7 @@ Each phase ends with something runnable. Do not start a phase until the previous
 - [x] Phase 1 — sidecar standalone (done 2026-10-12; see section 11)
 - [x] Phase 2 — single-node `/rag/query` (done 2026-10-12; see section 12)
 - [x] Phase 3 — two nodes, one machine (done 2026-10-12; see section 13)
-- [ ] Phase 4 — two machines
+- [x] Phase 4 — two machines, over the VPN with a pinned address (done 2026-10-12; see section 14). Not tested: node 2 asking node 1, and the relay path.
 - [ ] Phase 5 — 4/6/8 nodes
 - [ ] Phase 6 — evaluation
 
@@ -319,3 +319,118 @@ All 15 questions asked of node 1 with `scope: "all"`:
 **Cross-node questions fail, and this is a retrieval limit, not a transport bug.** Each needs one fact from each node, but the question is embedded once and its wording matches one topic much more strongly. For q13 all five merged chunks came from node 1's Chandrayaan documents; node 2's Satish Dhawan chunk scored lower and was cut by `final_k`. A global top-k by score cannot guarantee both halves are present. Options to evaluate later: reserve a share of `final_k` per node, raise `final_k`, rerank, or break the question into sub-questions. A stronger generator is also needed: with the right chunks missing, the 1.5B model guesses instead of refusing.
 
 **Stale peers cost the full timeout.** A peer that is remembered but down delays every query by `peer_timeout_ms` (5 s). Worth fixing before 8 nodes: skip peers not seen recently, or lower the timeout.
+
+## 14. Phase 4 results (2026-10-12, node 1 on machine 1, node 2 on machine 2)
+
+Node 1 was asked the 9 questions that need node 2's documents, with `scope: "all"`. Node 2 is reached through the VPN at its pinned address.
+
+| Type | Correct | Notes |
+| :-- | :-- | :-- |
+| `node2_only` (q07–q12) | 6 / 6 | Every context chunk came from machine 2's index. |
+| `cross_node` (q13–q15) | 0 / 3 | Same retrieval limit as in section 13. |
+
+- Peer round trip across the VPN: 30–74 ms (18–28 ms on one machine). The first query was the slowest, as it also sets up the connection.
+- Baseline with `scope: "local"` on three `node2_only` questions: q08 wrong ("2008-2012"), q10 and q12 right or partly right from the model's own memory, not from node 1's documents. So a correct local-only answer does not prove retrieval worked; check `contexts`.
+- Every query took an extra 5 s because node 1 still remembers `dd0020…`, the local test copy of node 2 from Phase 3, which is no longer running. Retrieval time was 5001 ms instead of about 60 ms. This is the stale-peer problem from section 13 and is the first thing to fix in Phase 5.
+- Cross-node detail: for q13 all five chunks came from node 1; for q15 all five came from node 2; for q14 four came from node 1 and the one from node 2 was about the wrong person. In each case one half of the needed evidence was missing.
+- mDNS-only discovery does not apply to this setup (see section 9, item 3). Not yet tested: asking node 2 for a node 1 answer across machines, and the relay path.
+
+## 15. Running it from scratch
+
+These steps take a fresh Linux machine (Ubuntu-like) to a working two-node setup. Do sections 15.1–15.4 on **both** machines, then start the nodes. Run everything from the repository folder.
+
+### 15.1 Install the tools (once per machine)
+
+```bash
+sudo apt install -y git build-essential clang cmake pkg-config curl   # compilers; RocksDB needs clang and cmake
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh        # Rust and cargo
+curl -LsSf https://astral.sh/uv/install.sh | sh                       # uv, the Python installer
+curl -fsSL https://ollama.com/install.sh | sh                         # Ollama, runs the answer-writing model
+```
+
+Open a new terminal afterwards so `cargo` and `uv` are found.
+
+### 15.2 Get the code
+
+```bash
+git clone git@github.com:midnight077/Slakshna-RAG.git Slakshna
+cd Slakshna
+git checkout feat/p2p-rag
+```
+
+The Bhaskera submodule is not needed for RAG nodes, because training is off.
+
+### 15.3 Build the node program
+
+```bash
+cargo build --release          # several minutes the first time; produces target/release/iiitd
+cargo test --release           # optional: Rust unit tests
+```
+
+### 15.4 Set up the Python helper and the model
+
+```bash
+uv venv .venv-rag --python 3.11
+uv pip install --python .venv-rag/bin/python --torch-backend cpu -r requirements-rag.txt
+.venv-rag/bin/python -m unittest tests/test_rag_store.py      # optional: should print OK
+
+ollama pull qwen2.5:1.5b       # about 1 GB
+ollama list                    # should list qwen2.5:1.5b; if Ollama is not running: ollama serve
+```
+
+The PDFs in `corpus/` come with the repository. The embedding model (about 90 MB) downloads by itself the first time a node starts, so the first start needs internet access.
+
+### 15.5 Start node 2 (machine 2)
+
+```bash
+./target/release/iiitd --config examples/rag-2node/node2.toml
+```
+
+Leave it running. Note its EndpointId, which node 1 needs:
+
+```bash
+curl localhost:8555/status       # the "endpoint_id" field
+```
+
+### 15.6 Point node 1 at node 2, then start node 1 (machine 1)
+
+In `examples/rag-2node/node1.toml`, the `peers` line must hold node 2's EndpointId and address:
+
+```toml
+peers = ["<node 2 endpoint_id>@<machine 2 IP>:9001"]
+```
+
+It already holds the current values (`313823…@192.168.3.143:9001`). They change only if `data-rag-node2/` is deleted or machine 2's address changes. Connect the VPN, then:
+
+```bash
+./target/release/iiitd --config examples/rag-2node/node1.toml
+```
+
+### 15.7 Check and ask
+
+```bash
+curl localhost:8545/status         # "peers": 1
+curl localhost:8545/rag/status     # "peer_targets" lists node 2's EndpointId
+
+curl -s localhost:8545/rag/query -H 'content-type: application/json' \
+  -d '{"query": "Where was Abdul Kalam born?"}' | python3 -m json.tool
+```
+
+The reply holds `answer`, `contexts` (passages used and which node they came from), `peers` (each peer asked and whether it replied) and `timings_ms`. Add `"scope": "local"` or `"scope": "peers"` to search only this node or only the others. Test questions with expected answers are in `corpus/questions.jsonl`. Node 2 can be asked the same way on port `8555`.
+
+Stop a node with `Ctrl+C` in its terminal, or `pkill -x iiitd`.
+
+### 15.8 Both nodes on one machine
+
+Skip 15.6's VPN step and set node 1's `peers = []`: the two nodes find each other through mDNS on the same machine. Start both commands in two terminals.
+
+### 15.9 Common problems
+
+| Symptom | Cause and fix |
+| :-- | :-- |
+| `"peers": 0` | Node 2 not running, VPN down, or wrong id/address in `peers`. UDP port 9001 on machine 2 must be reachable. |
+| "Address already in use" | A node is already running on that machine: `pkill -x iiitd`. |
+| Empty or failed answer | Ollama is not running (`ollama serve`) or the model is missing (`ollama pull qwen2.5:1.5b`). |
+| Node exits waiting for the sidecar | `.venv-rag` missing or incomplete; redo 15.4. The first start can take a few minutes while the embedding model downloads. |
+| Every question takes 5 s longer | A remembered peer is no longer running (see section 14). |
+| New PDFs not used | Put them in the node's `corpus_dir` and restart the node; already-indexed files are skipped. |
