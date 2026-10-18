@@ -223,8 +223,9 @@ pub struct RagConfig {
     /// How often every peer's signed root is fetched again in the background.
     #[serde(default = "default_root_refresh_secs")]
     pub root_refresh_secs: u64,
-    /// A peer not heard from for this long is skipped at query time and left
-    /// to the background refresh. Peers never tried yet are always asked.
+    /// A peer not heard from for this long, or whose latest contact failed, is
+    /// skipped at query time and left to the background refresh. Peers never
+    /// tried yet are always asked.
     #[serde(default = "default_peer_stale_secs")]
     pub peer_stale_secs: u64,
 }

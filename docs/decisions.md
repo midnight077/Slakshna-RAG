@@ -257,3 +257,7 @@ They are from the plan's section 7, which is otherwise done in M6, with the plan
 
 **J22. Registry details: rollbacks are flagged without evidence; equivocation compares signed fields; flags and evidence are not duplicated (Claude, 2026-10-18).**
 *Why:* the plan asks for evidence only for equivocation, where two signed roots with one version prove the peer lied. Ed25519 signatures are deterministic, so comparing the signed fields is the same as comparing roots, and is robust to how they are encoded. Without the de-duplication, a peer that keeps equivocating would grow the evidence list on every refresh.
+
+**J23. Skip a peer as soon as its latest contact failed (User, 2026-10-19).**
+`should_ask` asks a peer only if it has never been tried, or if it answered within `peer_stale_secs` **and** its latest contact (`hello` or query) did not fail. The background refresh keeps asking every peer, and its next answer brings the peer back. This changes the rule in section 6.1 of `merkle_tree.md`, which had only the `peer_stale_secs` condition.
+*Why:* in the M5 results, a peer that had just died still cost the full timeout on every query until `peer_stale_secs` (3 minutes by default) passed. Now it costs one. The evaluation (M8) starts and stops nodes often, and those delays would distort its latency numbers. The trade-off: a healthy peer that misses one request is skipped for at most `root_refresh_secs` (60 s).

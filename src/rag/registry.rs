@@ -51,6 +51,15 @@ impl PeerRoot {
         }
     }
 
+    /// True if the most recent contact with this peer failed.
+    fn last_contact_failed(&self) -> bool {
+        match (self.last_ok, self.last_fail) {
+            (Some(ok), Some(fail)) => fail > ok,
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
     #[allow(dead_code)] // used by the query pipelines from Phase M6 on
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.iter().any(|f| f == flag)
@@ -160,14 +169,19 @@ impl RootRegistry {
         entry.last_error = Some(error);
     }
 
-    /// Whether a query should go to `peer`: it answered within `stale`, or it
-    /// has never been tried. Peers that are only failing are left to the
-    /// background refresh.
+    /// Whether a query should go to `peer`: it has never been tried, or it
+    /// answered within `stale` and its latest contact did not fail.
+    ///
+    /// A peer is skipped from its first failure on, so a peer that has just
+    /// died costs at most one timeout. The background refresh keeps asking
+    /// every peer, and its next answer brings the peer back.
     pub fn should_ask(&self, peer: &EndpointId, now: Instant, stale: Duration) -> bool {
         match self.peers.get(peer) {
             None => true,
             Some(entry) => match entry.last_ok {
-                Some(last_ok) => now.saturating_duration_since(last_ok) <= stale,
+                Some(last_ok) => {
+                    now.saturating_duration_since(last_ok) <= stale && !entry.last_contact_failed()
+                }
                 None => entry.last_fail.is_none(),
             },
         }
@@ -194,8 +208,7 @@ impl RootRegistry {
                 let entry = self.peers.get(id).cloned().unwrap_or_default();
                 let status = match (entry.last_ok, entry.last_fail) {
                     (None, None) => "untried",
-                    (Some(ok), Some(fail)) if fail > ok => "failing",
-                    (None, Some(_)) => "failing",
+                    _ if entry.last_contact_failed() => "failing",
                     _ => "ok",
                 };
                 PeerRootStatus {
@@ -338,9 +351,14 @@ mod tests {
         registry.record_ok(alive, much_later);
         assert!(registry.should_ask(&alive, much_later, stale));
 
-        // A failure after recent contact does not skip the peer straight away.
-        registry.record_failure(alive, "timeout".into(), much_later);
-        assert!(registry.should_ask(&alive, much_later, stale));
+        // A failure after recent contact skips the peer at once...
+        let failed = much_later + Duration::from_secs(1);
+        registry.record_failure(alive, "timeout".into(), failed);
+        assert!(!registry.should_ask(&alive, failed, stale));
+        // ...until it answers again, e.g. to the next background refresh.
+        let refreshed = failed + Duration::from_secs(60);
+        registry.record_ok(alive, refreshed);
+        assert!(registry.should_ask(&alive, refreshed, stale));
     }
 
     #[test]

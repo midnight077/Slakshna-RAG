@@ -283,7 +283,7 @@ struct PeerRoot {
   - Same version, different root → `equivocation`. Both signed roots go into `evidence`, and the peer's chunks are refused from then on.
   - Higher version → accepted, `first_seen = now`.
 - **Who gets a query:**
-  - A target whose `last_ok` is within `peer_stale_secs` (180).
+  - A target whose `last_ok` is within `peer_stale_secs` (180) **and whose latest contact did not fail**. (The second condition was added on 2026-10-19 by the user's decision J23, after the M5 results showed that a just-died peer otherwise cost a full timeout per query for up to `peer_stale_secs`.)
   - A target the registry has **never** tried yet, so the first query after startup still reaches everyone.
   - Targets that are only failing are left to the background refresh and skipped at query time.
   - This fixes the 5 s stale-peer delay from section 14 of `p2p_rag_plan.md`.
@@ -608,7 +608,19 @@ Recovery, with node 1 on short timers (`root_refresh_secs = 10`, `peer_stale_sec
 
 - `cargo test --release`: 25 tests pass (5 new registry tests). The Python tests pass. The build still has its 9 old warnings and no new ones. `rustfmt --check` is clean on `registry.rs`.
 
-Observed, worth deciding before M8: between a peer dying and `peer_stale_secs` passing, every query still waits out the full timeout. That is up to 3 minutes of 5 s queries with the defaults; in M6 round 1 the wait is `select_timeout_ms` (2 s). This is the rule in 6.1 as written. A stricter rule would also skip a peer whose latest contact failed, and the refresh would bring it back within `root_refresh_secs`. Not changed without the user's decision.
+Observed, worth deciding before M8: between a peer dying and `peer_stale_secs` passing, every query still waits out the full timeout. That is up to 3 minutes of 5 s queries with the defaults; in M6 round 1 the wait is `select_timeout_ms` (2 s). This is the rule in 6.1 as written. A stricter rule would also skip a peer whose latest contact failed, and the refresh would bring it back within `root_refresh_secs`.
+
+**Decided 2026-10-19 (user, J23): the stricter rule.** `should_ask` now also requires that the peer's latest contact did not fail. The same recovery run (short timers, node 2 stopped at 2 s, restarted at 24 s):
+
+| Time | Node 2 | `peer_retrieve` | Node 2's entry |
+| :-- | :-- | --: | :-- |
+| 0 s | up | 35 ms | ok |
+| 4 s | just died | 5001 ms | timeout; this failure marks it |
+| 9 s | down | 0 ms | `skipped_stale` |
+| 17 s | down | 0 ms | `skipped_stale` |
+| 35 s | up, after the next refresh | 33 ms | ok |
+
+A just-died peer now costs one timed-out query, not every query for `peer_stale_secs`. The cost is that a peer which misses a single request is skipped until the next successful refresh, at most `root_refresh_secs` later.
 
 Differences from the plan, and additions (logged in `docs/decisions.md`, J19–J22):
 - The three settings above come from section 7 and were added in M5 rather than M6, because the registry needs them. The other section-7 settings stay in M6.
