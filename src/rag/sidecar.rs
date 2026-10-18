@@ -1,6 +1,6 @@
 //! Client for, and launcher of, the local Python RAG sidecar.
 
-use super::merkle::{ ClusterEntry, Commitment };
+use super::merkle::{ decode_f32le, ClusterEntry, Commitment };
 use super::protocol::ProvenChunk;
 use super::Chunk;
 use crate::config::{ NodeConfig, RagConfig };
@@ -129,6 +129,24 @@ impl SidecarClient {
         ).await
     }
 
+    /// Embed texts with this node's model: unit vectors, one per text.
+    pub async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, BoxError> {
+        #[derive(Deserialize)]
+        struct Embedded {
+            dim: u32,
+            vectors: Vec<String>,
+        }
+        let embedded: Embedded = self.post(
+            "/embed",
+            &serde_json::json!({ "texts": texts }),
+            RETRIEVE_TIMEOUT,
+        ).await?;
+        embedded.vectors
+            .iter()
+            .map(|v| decode_f32le(v, embedded.dim))
+            .collect()
+    }
+
     /// This node's unsigned Merkle commitment; the node signs it.
     pub async fn commitment(&self) -> Result<Commitment, BoxError> {
         let response = self
@@ -217,6 +235,7 @@ pub async fn spawn_sidecar(
         .args(["--data-dir", &node.data_dir])
         .args(["--port", &rag.sidecar_port.to_string()])
         .args(["--embedding-model", &rag.embedding_model])
+        .args(["--n-clusters", &rag.n_clusters.to_string()])
         .args(["--generator", &rag.generator])
         .args(["--generator-model", &rag.generator_model])
         .args(["--generator-url", &rag.generator_url])

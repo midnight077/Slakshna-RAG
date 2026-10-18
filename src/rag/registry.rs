@@ -60,7 +60,6 @@ impl PeerRoot {
         }
     }
 
-    #[allow(dead_code)] // used by the query pipelines from Phase M6 on
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.iter().any(|f| f == flag)
     }
@@ -108,7 +107,6 @@ pub struct RootRegistry {
 }
 
 impl RootRegistry {
-    #[allow(dead_code)] // used by the query pipelines from Phase M6 on
     pub fn get(&self, peer: &EndpointId) -> Option<&PeerRoot> {
         self.peers.get(peer)
     }
@@ -155,6 +153,11 @@ impl RootRegistry {
             RootOutcome::Unchanged | RootOutcome::BadSignature => {}
         }
         outcome
+    }
+
+    /// Note a rule break seen while querying `peer` (e.g. "score_mismatch").
+    pub fn add_flag(&mut self, peer: EndpointId, flag: &str) {
+        self.peers.entry(peer).or_default().flag(flag);
     }
 
     /// The peer answered a query.

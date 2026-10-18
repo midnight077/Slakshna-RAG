@@ -172,6 +172,29 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// How a query reaches peers' indexes (`docs/merkle_tree.md`, section 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Retrieval {
+    /// Round 1 asks every peer for its nearest cluster centroids; round 2
+    /// fetches chunks only from the peers whose clusters were chosen.
+    #[default]
+    TwoRound,
+    /// One round: every peer sends its best chunks. The evaluation baseline.
+    Flat,
+}
+
+/// What round 1 ranks clusters by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectBy {
+    /// Similarity of the query to the centroid, computed by the asker (verifiable).
+    #[default]
+    Centroid,
+    /// The peer's claimed best chunk score in the cluster (checked in round 2).
+    BestChunk,
+}
+
 /// Retrieval-augmented generation. Off unless `[rag] enabled = true`.
 ///
 /// The ML work is done by a local Python sidecar (`rag_engine.py`) that the
@@ -228,6 +251,38 @@ pub struct RagConfig {
     /// tried yet are always asked.
     #[serde(default = "default_peer_stale_secs")]
     pub peer_stale_secs: u64,
+    /// "two_round" (default) or "flat". A query may override it.
+    #[serde(default)]
+    pub retrieval: Retrieval,
+    /// k-means clusters in this node's index; 0 = round(sqrt(number of chunks)).
+    #[serde(default)]
+    pub n_clusters: u32,
+    /// Round 1: centroids each peer returns.
+    #[serde(default = "default_centroids_per_peer")]
+    pub centroids_per_peer: usize,
+    /// Round 1: clusters kept over all peers.
+    #[serde(default = "default_max_clusters")]
+    pub max_clusters: usize,
+    /// Round 1: clusters scoring below this are dropped; the best is always kept.
+    #[serde(default = "default_min_centroid_score")]
+    pub min_centroid_score: f64,
+    #[serde(default)]
+    pub select_by: SelectBy,
+    /// Round 2: chunks fetched from each chosen cluster.
+    #[serde(default = "default_chunks_per_cluster")]
+    pub chunks_per_cluster: usize,
+    /// Re-embed peers' chunks and use the recomputed scores, not the peers' own.
+    #[serde(default = "default_true")]
+    pub rescore: bool,
+    /// Largest allowed |claimed - recomputed| score before a peer is flagged.
+    #[serde(default = "default_score_tolerance")]
+    pub score_tolerance: f64,
+    /// Drop peer chunks whose proof fails (otherwise kept, marked "failed_proof").
+    #[serde(default = "default_true")]
+    pub drop_unverified: bool,
+    /// Drop peer chunks proven against a root first seen during the query itself.
+    #[serde(default)]
+    pub require_prior_root: bool,
 }
 
 fn default_sidecar_port() -> u16 { 8600 }
@@ -242,6 +297,11 @@ fn default_generator_url() -> String { "http://127.0.0.1:11434".to_string() }
 fn default_select_timeout_ms() -> u64 { 2000 }
 fn default_root_refresh_secs() -> u64 { 60 }
 fn default_peer_stale_secs() -> u64 { 180 }
+fn default_centroids_per_peer() -> usize { 3 }
+fn default_max_clusters() -> usize { 5 }
+fn default_min_centroid_score() -> f64 { 0.2 }
+fn default_chunks_per_cluster() -> usize { 3 }
+fn default_score_tolerance() -> f64 { 0.01 }
 
 impl Default for RagConfig {
     fn default() -> Self {
@@ -262,6 +322,17 @@ impl Default for RagConfig {
             select_timeout_ms: default_select_timeout_ms(),
             root_refresh_secs: default_root_refresh_secs(),
             peer_stale_secs: default_peer_stale_secs(),
+            retrieval: Retrieval::default(),
+            n_clusters: 0,
+            centroids_per_peer: default_centroids_per_peer(),
+            max_clusters: default_max_clusters(),
+            min_centroid_score: default_min_centroid_score(),
+            select_by: SelectBy::default(),
+            chunks_per_cluster: default_chunks_per_cluster(),
+            rescore: true,
+            score_tolerance: default_score_tolerance(),
+            drop_unverified: true,
+            require_prior_root: false,
         }
     }
 }
@@ -305,6 +376,21 @@ impl Config {
             return Err(
                 "rag.select_timeout_ms, rag.root_refresh_secs and rag.peer_stale_secs must be positive".into()
             );
+        }
+        let rag = &config.rag;
+        if rag.centroids_per_peer == 0 || rag.max_clusters == 0 || rag.chunks_per_cluster == 0 {
+            return Err(
+                "rag.centroids_per_peer, rag.max_clusters and rag.chunks_per_cluster must be positive".into()
+            );
+        }
+        if !(0.0..=1.0).contains(&rag.min_centroid_score) {
+            return Err("rag.min_centroid_score must be between 0 and 1".into());
+        }
+        if !rag.score_tolerance.is_finite() || rag.score_tolerance < 0.0 {
+            return Err("rag.score_tolerance must be a non-negative number".into());
+        }
+        if rag.n_clusters > 64 {
+            return Err("rag.n_clusters must be at most 64 (0 = automatic)".into());
         }
         Ok(config)
     }

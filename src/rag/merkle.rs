@@ -9,9 +9,6 @@
 //! section 2. `tests/fixtures/merkle_vectors.json` is checked by both the
 //! Python and the Rust tests, so the two languages cannot drift apart.
 
-// Used by the peer protocol from Phase M4 on; until then only the tests call it.
-#![allow(dead_code)]
-
 use crate::history::BoxError;
 use iroh::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
@@ -87,6 +84,24 @@ pub fn fold_proof(start: Hash, proof: &[ProofStep]) -> Result<Hash, BoxError> {
         };
     }
     Ok(current)
+}
+
+/// Decode `dim` little-endian float32 values from hex (e.g. embeddings from
+/// the sidecar's `/embed`).
+pub fn decode_f32le(hex_str: &str, dim: u32) -> Result<Vec<f32>, BoxError> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("vector is not hex: {}", e))?;
+    if bytes.len() != dim as usize * 4 {
+        return Err(format!(
+            "vector has {} bytes, expected {}",
+            bytes.len(),
+            dim as usize * 4
+        )
+        .into());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
 }
 
 /// What a peer sends to prove one of its clusters (`docs/merkle_tree.md`, 3.3).

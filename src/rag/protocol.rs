@@ -111,6 +111,7 @@ impl ProvenChunk {
             text: self.text,
             score: self.score,
             node_id: Some(node_id.to_string()),
+            ..Default::default()
         }
     }
 }

@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M5 done (2026-10-18); M6–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M5 done; M6 implemented and checked on one machine (2026-10-19), two-machine run pending; M7–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -485,7 +485,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M3 — Rust verification library (done 2026-10-18; see section 14)
 - [x] Phase M4 — wire protocol v2 and own signed root (done 2026-10-18; see section 14)
 - [x] Phase M5 — root registry and stale-peer skipping (done 2026-10-18; see section 14)
-- [ ] Phase M6 — two-round query and flat mode
+- [ ] Phase M6 — two-round query and flat mode (in progress: implemented, single-machine check done 2026-10-19; the two-machine run is still to do; see section 14)
 - [ ] Phase M7 — simulated adversaries
 - [ ] Phase M8 — evaluation
 
@@ -627,3 +627,52 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J19–J
 - `last_ok` counts any answer, including one with a bad, rolled-back or conflicting root. Reachability decides who is asked; trust is handled by the flags (checked from M6 on).
 - `skipped_stale` (from 6.4) is reported already.
 - A rollback is flagged without keeping evidence. Equivocation compares the signed fields, not the signature bytes. Each flag is listed once, and evidence is not duplicated.
+
+### Phase M6 (2026-10-19) — single-machine part; two-machine run pending
+
+Done:
+- `src/rag/retrieval.rs` (new) has the two-round pipeline (6.2) and the flat pipeline (6.3), with shared checks. The pure parts are separate functions with unit tests: `select_clusters`, `check_chunks`, `apply_rescore` and `overclaimed`.
+- `src/rag/mod.rs` has the output fields from 6.4: `Chunk.cluster_id`, `verification`, `claimed_score` and `flags`; the new `PeerResult` fields; `Timings.select`, `fetch` and `rescore`; and `retrieval` in the response.
+- `src/config.rs` has the section-7 settings (except `adversary`, which comes with M7) and their validation.
+- `src/rag/sidecar.rs` has `embed()` and passes `--n-clusters`.
+- `scripts/rag_run_questions.py` (new) asks a node every question and saves the full responses.
+- `cargo test --release`: 31 tests pass (6 new). The Python tests pass. The build has no new warnings, and the blanket `allow(dead_code)` from M3 is gone. `rustfmt --check` is clean on the new files.
+
+Check: all 15 questions asked of node 1 (`examples/rag-2node` configs, Ollama `qwen2.5:1.5b`, node 2 on the same machine), in both modes:
+
+| Type | two_round | flat |
+| :-- | :-- | :-- |
+| `node1_only` (q01–q06) | 6 / 6 | 6 / 6 |
+| `node2_only` (q07–q12) | **6 / 6** | **6 / 6** |
+| `cross_node` (q13–q15) | 0 / 3 | 0 / 3 |
+
+- Every remote context was `verified`: 35 in two_round, 36 in flat. No proofs failed and no flags were raised.
+- The recomputed scores matched node 2's own to within about 5·10⁻⁸, far inside `score_tolerance = 0.01`.
+- In two_round, round 2 went to exactly the peers with `selected_clusters` (checked for every peer of every question).
+- Median timings, two_round: `peer_retrieve` 417 ms = select 41 + fetch 25 + rescore 354. Flat: 237 ms = fetch 39 + rescore 197. Rescoring dominates: it embeds 9 chunks (two_round, 3 clusters × 3) or 5 (flat) on the CPU, inside the plan's 0.1–0.5 s estimate.
+- Cross-node answers are wrong in both modes, as in Phases 3–4: q13 "Sriharikota"; q14 "Chandrayaan-3, born Satish Dhawan" (two_round) and "Chandrayaan-3, born in Srinagar" (flat); q15 "No.". For q13 all five contexts were local in both modes. The global top-`final_k` still keeps one side's evidence only.
+- Generation times are not comparable between the modes: flat ran second, with mostly the same contexts, and Ollama reused its cached prompts.
+
+Selection with a third node (temporary, on machine 1, indexing node 1's documents, generator `none`), two_round:
+
+| Question | node 2 (scientists) won | node 3 (space missions) won |
+| :-- | :-- | :-- |
+| q01, q03, q05 (space) | 2 clusters | 3 clusters |
+| q07 (Kalam) | 3 clusters | **none, so no round 2** |
+| q09, q10 (scientists, park) | 3 clusters | 2 clusters |
+
+- Round 2 skips a peer only when its clusters lose. With 2 peers × `centroids_per_peer = 3` = 6 candidates for `max_clusters = 5`, and MiniLM giving unrelated topics cosines above `min_centroid_score = 0.2`, both peers nearly always win something. This is what D4 warned about, and what the M8 sweep of `max_clusters` and `min_centroid_score` is for.
+- A fresh index of `corpus/node1` on node 3 had the same root as node 1 (`802f7d37…`), so the commitment is deterministic for the same documents on the same machine.
+
+Still to do for M6: the same 15 questions with node 2 on machine 2 (Phase 4 setup), in both modes.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, J24–J31):
+- The pipelines live in a new `src/rag/retrieval.rs` instead of `src/rag/mod.rs`.
+- `/rag/query` takes an optional `retrieval` field to override `[rag] retrieval` for one query.
+- Caps on what an asker accepts: at most `centroids_per_peer` centroids (a repeated cluster counts once), `chunks_per_cluster` chunks per cluster, and `top_k` chunks in flat mode. Extra chunks count as `rejected_chunks`.
+- Round-2 chunks are checked against the subtree roots verified in round 1; the round-2 cluster entries are not needed.
+- A peer flagged `equivocation` is not asked at all (`status: "refused"`).
+- `Chunk` also has `flags` (e.g. `score_mismatch`). Local chunks are labelled `verification: "local"`. The response says which `retrieval` mode ran.
+- `min_centroid_score` applies to the ranking key (the similarity, or the claimed best score with `select_by = "best_chunk"`).
+- `score_overclaim` is also raised when a selected cluster delivered no verified chunk at all, but only if round 2 answered.
+- `adversary` is left to M7.

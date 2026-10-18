@@ -261,3 +261,31 @@ They are from the plan's section 7, which is otherwise done in M6, with the plan
 **J23. Skip a peer as soon as its latest contact failed (User, 2026-10-19).**
 `should_ask` asks a peer only if it has never been tried, or if it answered within `peer_stale_secs` **and** its latest contact (`hello` or query) did not fail. The background refresh keeps asking every peer, and its next answer brings the peer back. This changes the rule in section 6.1 of `merkle_tree.md`, which had only the `peer_stale_secs` condition.
 *Why:* in the M5 results, a peer that had just died still cost the full timeout on every query until `peer_stale_secs` (3 minutes by default) passed. Now it costs one. The evaluation (M8) starts and stops nodes often, and those delays would distort its latency numbers. The trade-off: a healthy peer that misses one request is skipped for at most `root_refresh_secs` (60 s).
+
+**J24. The query pipelines go in a new file, `src/rag/retrieval.rs` (Claude, 2026-10-19).**
+*Why:* the plan put them in `src/rag/mod.rs`, which already holds the service and its types. A separate file keeps each part readable, and keeps the checking rules (cluster selection, chunk proofs, rescoring, overclaims) as plain functions that are unit-tested without a network.
+
+**J25. A query can choose its retrieval mode (Claude, 2026-10-19).**
+`/rag/query` accepts `"retrieval": "two_round"` or `"flat"`, overriding `[rag] retrieval` for that query.
+*Why:* the evaluation compares the two modes on the same running nodes. Without the override, every comparison would need a config change and a restart.
+
+**J26. The asker never accepts more than it asked for (Claude, 2026-10-19).**
+It takes at most `centroids_per_peer` centroids per peer (a cluster offered twice counts once), at most `chunks_per_cluster` chunks per cluster, and at most `top_k` chunks per peer in flat mode. Extra chunks are counted in `rejected_chunks`.
+*Why:* otherwise a peer could win extra places in round 1, or flood the merge with more chunks than any honest peer sends. The plan capped only the responder's side.
+
+**J27. Round-2 chunks are checked against the subtree roots verified in round 1 (Claude, 2026-10-19).**
+*Why:* those roots are already proven to belong to the peer's signed root, so checking a chunk against them proves it is in the corpus. The round-2 cluster entries are redundant: if they differed from round 1, the chunk proofs would fail anyway.
+
+**J28. A peer caught equivocating is not asked at all; it is reported as `refused` (Claude, 2026-10-19).**
+*Why:* the plan says such a peer's chunks are refused from then on. Not asking at all also saves the round trip, and the new status makes the reason visible. The flag lives in memory, so a restart forgives the peer (plan, section 11).
+
+**J29. Output details: `Chunk.flags`, `verification: "local"`, and `retrieval` in the response (Claude, 2026-10-19).**
+*Why:* the plan says a `score_mismatch` is flagged on the chunk as well as on the peer, so a chunk needs a place for flags. Labelling local chunks makes every context's origin explicit, and naming the mode in each response makes saved results self-describing.
+
+**J30. `min_centroid_score` applies to whatever round 1 ranks by (Claude, 2026-10-19).**
+It is the asker's similarity by default, or the claimed best chunk score with `select_by = "best_chunk"`.
+*Why:* the threshold and the ranking should use the same number. Otherwise a cluster could rank first and still be cut, or the other way round.
+
+**J31. A selected cluster that delivers no verified chunk counts as an overclaim (Claude, 2026-10-19).**
+This is only checked if round 2 answered at all; a timeout is not an overclaim.
+*Why:* the peer claimed a chunk with that score exists and then did not send one. That is the same promise broken as sending a worse chunk.

@@ -7,9 +7,10 @@
 pub mod merkle;
 pub mod protocol;
 pub mod registry;
+pub mod retrieval;
 pub mod sidecar;
 
-use crate::config::RagConfig;
+use crate::config::{ RagConfig, Retrieval };
 use crate::history::BoxError;
 use merkle::{ Commitment, SignedRoot };
 use protocol::{ RagRequest, RequestBody, ResponseBody };
@@ -25,14 +26,26 @@ use tracing::{ info, warn };
 
 /// One retrieved passage. `node_id` records which node's index it came from;
 /// the sidecar does not know it, so the node fills it in.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chunk {
     pub chunk_id: String,
     pub source: String,
     pub text: String,
+    /// For peers' chunks with `rescore` on, the score this node computed.
     pub score: f64,
     #[serde(default)]
     pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<u32>,
+    /// "local", "verified", "verified_new_root" or "failed_proof".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
+    /// The score the peer claimed, when this node recomputed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_score: Option<f64>,
+    /// E.g. "score_mismatch".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
 }
 
 /// Which indexes a query consults.
@@ -57,6 +70,9 @@ pub struct QueryRequest {
     pub final_k: Option<usize>,
     #[serde(default)]
     pub scope: Scope,
+    /// Overrides `[rag] retrieval` for this query ("two_round" or "flat").
+    #[serde(default)]
+    pub retrieval: Option<Retrieval>,
 }
 
 /// What a query needs from the mesh to reach other nodes.
@@ -69,11 +85,24 @@ pub struct PeerLink {
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerResult {
     pub endpoint_id: String,
-    /// "ok", "timeout", "error", or "skipped_stale" (not asked: it has not
-    /// answered for `peer_stale_secs`).
+    /// "ok", "timeout", "error", "no_root" (its answers matched no signed
+    /// root), "skipped_stale" (not asked: down lately) or "refused" (not
+    /// asked: caught equivocating).
     pub status: String,
+    /// Chunks kept from this peer.
     pub chunks: usize,
     pub rtt_ms: u64,
+    /// The root version the peer answered under.
+    pub root_version: Option<u64>,
+    /// Clusters (two_round) or cluster entries (flat) the peer offered.
+    pub offered_clusters: usize,
+    /// Clusters of this peer chosen in round 1; round 2 went only to peers with some.
+    pub selected_clusters: Vec<u32>,
+    /// Chunks dropped: failed proof, not requested, or over the requested count.
+    pub rejected_chunks: usize,
+    pub flags: Vec<String>,
+    pub round1_ms: Option<u64>,
+    pub round2_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -99,12 +128,19 @@ pub struct PeerHello {
 }
 
 impl PeerResult {
-    fn skipped_stale(peer: iroh::EndpointId) -> Self {
+    fn new(peer: iroh::EndpointId, status: &str) -> Self {
         PeerResult {
             endpoint_id: peer.to_string(),
-            status: "skipped_stale".to_string(),
+            status: status.to_string(),
             chunks: 0,
             rtt_ms: 0,
+            root_version: None,
+            offered_clusters: 0,
+            selected_clusters: Vec::new(),
+            rejected_chunks: 0,
+            flags: Vec::new(),
+            round1_ms: None,
+            round2_ms: None,
             error: None,
         }
     }
@@ -113,13 +149,21 @@ impl PeerResult {
 #[derive(Debug, Serialize)]
 pub struct Timings {
     pub local_retrieve: u64,
+    /// `select + fetch + rescore`.
     pub peer_retrieve: u64,
+    /// Round 1 and cluster selection (two_round only).
+    pub select: u64,
+    /// Round 2, or the single round of flat mode.
+    pub fetch: u64,
+    /// Re-embedding peers' chunks.
+    pub rescore: u64,
     pub generate: u64,
     pub total: u64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct QueryResponse {
+    pub retrieval: Retrieval,
     pub answer: String,
     pub contexts: Vec<Chunk>,
     pub peers: Vec<PeerResult>,
@@ -292,69 +336,12 @@ impl RagService {
         futures::future::join_all(link.targets.iter().map(|peer| self.hello_peer(&link.endpoint, *peer))).await
     }
 
-    /// Ask one peer for chunks, bounded by `peer_timeout_ms`. Never fails: a
-    /// slow or broken peer yields a `PeerResult` saying so and no chunks.
-    async fn ask_peer(
-        &self,
-        endpoint: &iroh::Endpoint,
-        peer: iroh::EndpointId,
-        query: &str,
-        top_k: usize,
-    ) -> (PeerResult, Vec<Chunk>) {
-        let started = Instant::now();
-        // Until the verifying pipelines exist (Phase M6 of merkle_tree.md), a
-        // flat `search` whose proofs are not yet checked.
-        let request = RagRequest::new(RequestBody::Search { query: query.to_string(), top_k });
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(self.config.peer_timeout_ms),
-            protocol::request_peer(endpoint, peer, &request, self.config.max_message_bytes),
-        ).await;
-        let rtt_ms = started.elapsed().as_millis() as u64;
-
-        let (status, error, chunks) = match outcome {
-            Ok(Ok(response)) => {
-                if response.embedding_model != self.config.embedding_model {
-                    warn!(
-                        "⚠️ Peer {} embeds with {} but this node uses {}; their scores are not comparable",
-                        peer.fmt_short(),
-                        response.embedding_model,
-                        self.config.embedding_model
-                    );
-                }
-                let chunks = match response.body {
-                    ResponseBody::Search { chunks, .. } => chunks
-                        .into_iter()
-                        .map(|chunk| chunk.into_chunk(&response.node_id))
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                ("ok", None, chunks)
-            }
-            Ok(Err(e)) => ("error", Some(e.to_string()), Vec::new()),
-            Err(_) => ("timeout", None, Vec::new()),
-        };
-
-        let now = Instant::now();
-        match status {
-            "ok" => self.registry().record_ok(peer, now),
-            _ => self.registry().record_failure(peer, error.clone().unwrap_or_else(|| "query timed out".to_string()), now),
-        }
-
-        let result = PeerResult {
-            endpoint_id: peer.to_string(),
-            status: status.to_string(),
-            chunks: chunks.len(),
-            rtt_ms,
-            error,
-        };
-        (result, chunks)
-    }
-
     /// Chunks from this node's own index, tagged with this node's id.
     pub async fn retrieve_local(&self, query: &str, top_k: usize) -> Result<Vec<Chunk>, BoxError> {
         let mut chunks = self.sidecar.retrieve(query, top_k).await?.chunks;
         for chunk in &mut chunks {
             chunk.node_id = Some(self.node_id.clone());
+            chunk.verification = Some(retrieval::LOCAL.to_string());
         }
         Ok(chunks)
     }
@@ -370,6 +357,7 @@ impl RagService {
         let started = Instant::now();
         let top_k = request.top_k.unwrap_or(self.config.top_k);
         let final_k = request.final_k.unwrap_or(self.config.final_k);
+        let mode = request.retrieval.unwrap_or(self.config.retrieval);
 
         // The local index and every peer are consulted at the same time, so
         // retrieval takes as long as the slowest one, not the sum.
@@ -384,33 +372,20 @@ impl RagService {
         };
 
         let remote = async {
-            let peers_started = Instant::now();
-            let mut outcomes = Vec::new();
-            if let Some(link) = link.as_ref().filter(|_| request.scope != Scope::Local) {
-                // Skip peers that are known to be down: each would cost the
-                // whole peer timeout. The background refresh brings them back.
-                let (asked, skipped): (Vec<&iroh::EndpointId>, Vec<&iroh::EndpointId>) = {
-                    let registry = self.registry();
-                    let stale = Duration::from_secs(self.config.peer_stale_secs);
-                    let now = Instant::now();
-                    link.targets.iter().partition(|peer| registry.should_ask(peer, now, stale))
-                };
-                outcomes = futures::future::join_all(
-                    asked.iter().map(|peer| self.ask_peer(&link.endpoint, **peer, &request.query, top_k)),
-                ).await;
-                outcomes.extend(skipped.iter().map(|peer| (PeerResult::skipped_stale(**peer), Vec::new())));
+            match link.as_ref().filter(|_| request.scope != Scope::Local) {
+                Some(link) => match mode {
+                    Retrieval::TwoRound => self.two_round(&request.query, link, started).await,
+                    Retrieval::Flat => self.flat(&request.query, top_k, link, started).await,
+                },
+                None => Ok(retrieval::RemoteRetrieval::default()),
             }
-            (outcomes, peers_started.elapsed().as_millis() as u64)
         };
 
-        let (local, (outcomes, peer_retrieve)) = tokio::join!(local, remote);
+        let (local, remote) = tokio::join!(local, remote);
         let (mut pooled, local_retrieve) = local?;
-
-        let mut peers = Vec::new();
-        for (result, chunks) in outcomes {
-            peers.push(result);
-            pooled.extend(chunks);
-        }
+        let remote = remote?;
+        pooled.extend(remote.chunks);
+        let peers = remote.peers;
 
         let contexts = merge_chunks(pooled, final_k);
 
@@ -425,12 +400,16 @@ impl RagService {
         let generate = generate_started.elapsed().as_millis() as u64;
 
         Ok(QueryResponse {
+            retrieval: mode,
             answer,
             contexts,
             peers,
             timings_ms: Timings {
                 local_retrieve,
-                peer_retrieve,
+                peer_retrieve: remote.select_ms + remote.fetch_ms + remote.rescore_ms,
+                select: remote.select_ms,
+                fetch: remote.fetch_ms,
+                rescore: remote.rescore_ms,
                 generate,
                 total: started.elapsed().as_millis() as u64,
             },
@@ -466,7 +445,7 @@ mod tests {
             source: "doc".to_string(),
             text: text.to_string(),
             score,
-            node_id: None,
+            ..Default::default()
         }
     }
 

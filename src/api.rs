@@ -306,6 +306,7 @@ async fn rag_status(AxumState(state): AxumState<SharedState>) -> impl IntoRespon
             "sidecar": sidecar,
             "peer_targets": targets,
             "own_root": rag.own_root().await,
+            "retrieval": rag.config.retrieval,
             "registry": rag.registry_status(&target_ids),
             "top_k": rag.config.top_k,
             "final_k": rag.config.final_k
