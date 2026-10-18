@@ -31,7 +31,7 @@ bash setup.sh                                # Python deps, runtime dirs, releas
 cargo check                                  # fast validation of Rust changes
 cargo build --release                        # produces target/release/iiitd
 cargo test --release                         # Rust unit tests (identity.rs, rag/mod.rs); --release reuses the built dependencies
-cargo fmt --check
+rustfmt --check src/rag/merkle.rs                # new Rust files only; existing files are not rustfmt-formatted (decision I5)
 
 python -m unittest tests/test_delta_transport.py   # delta wire-format tests (needs torch)
 python ml_engine.py <my_id> <peer_id...>            # one ML epoch with no networking
@@ -39,7 +39,7 @@ python ml_engine.py <my_id> <peer_id...>            # one ML epoch with no netwo
 # RAG sidecar (Python, separate environment from Bhaskera)
 uv venv .venv-rag --python 3.11
 uv pip install --python .venv-rag/bin/python --torch-backend cpu -r requirements-rag.txt
-.venv-rag/bin/python -m unittest tests/test_rag_store.py tests/test_rag_merkle.py
+.venv-rag/bin/python -m unittest tests/test_rag_store.py tests/test_rag_merkle.py tests/test_rag_server.py
 .venv-rag/bin/python scripts/rag_merkle_vectors.py    # rewrite tests/fixtures/merkle_vectors.json; only when the Merkle format changes on purpose
 .venv-rag/bin/python rag_engine.py ingest --data-dir ./data-rag-node1 --path corpus/node1
 .venv-rag/bin/python rag_engine.py serve --data-dir ./data-rag-node1 --port 8600   # needs Ollama running
@@ -118,7 +118,7 @@ The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running loc
 
 ## Conventions
 
-- Rust: `cargo fmt`, `snake_case` functions, `CamelCase` types. Python: four spaces, `snake_case`.
+- Rust: `snake_case` functions, `CamelCase` types. Run `rustfmt` on new files only; existing files keep their `{ A, B }` brace style, so match the surrounding code when editing them and don't run `cargo fmt` over the tree (decision I5). Python: four spaces, `snake_case`.
 - Commits use Conventional Commit prefixes (`feat:`, `docs:`, `refactor:`).
 - Runtime output (`data-node*/`, `logs/`, `ml_models/`, `ml_states/`, `hf_cache/`, `config_*.yaml`) is not source and must not be committed.
 - Changes inside `Bhaskera/` are committed and pushed in the submodule first (branch `Slakshna`), then the parent repo's pointer is updated.

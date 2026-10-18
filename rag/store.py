@@ -45,7 +45,8 @@ class VectorStore:
         self.version = 0
         # Re-entrant, so add_documents can hold it across its adds and the
         # commit: other threads never see chunks that are not yet committed.
-        self._lock = threading.RLock()
+        # Callers hold it too when several reads must come from one version.
+        self.lock = threading.RLock()
         os.makedirs(directory, exist_ok=True)
         if os.path.exists(self._path("meta.json")):
             self._load()
@@ -127,7 +128,7 @@ class VectorStore:
 
     def commitment_summary(self):
         """The fields of this node's root that Rust signs (see docs/merkle_tree.md, 2.4)."""
-        with self._lock:
+        with self.lock:
             return {
                 "root": self.commitment.root_hex,
                 "version": self.version,
@@ -145,7 +146,7 @@ class VectorStore:
         `source` is skipped if its text is unchanged and rejected if it differs.
         """
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        with self._lock:
+        with self.lock:
             known = self.documents.get(source)
             if known == digest:
                 return 0
@@ -169,7 +170,7 @@ class VectorStore:
         The version is the current Unix time in milliseconds, and always more
         than the previous one, so peers can tell a newer root from an older one.
         """
-        with self._lock:
+        with self.lock:
             k = choose_k(len(self.chunks), self.n_clusters)
             if k == 0:
                 centroids = np.zeros((0, self.embedder.dim), dtype=np.float32)
@@ -186,7 +187,7 @@ class VectorStore:
 
     def add_documents(self, documents):
         """Add `(source, text)` pairs, then commit once if anything was added."""
-        with self._lock:
+        with self.lock:
             added = 0
             try:
                 for source, text in documents:
@@ -234,7 +235,7 @@ class VectorStore:
         also carries `cluster_id` and `chunk_proof`, and `clusters` holds the
         entry of every cluster those chunks belong to.
         """
-        with self._lock:
+        with self.lock:
             if with_proofs:
                 self._require_committed()
             results = []
@@ -257,7 +258,7 @@ class VectorStore:
         Each entry also has `best_chunk_score`, the best score of any chunk in
         that cluster.
         """
-        with self._lock:
+        with self.lock:
             self._require_committed()
             if n <= 0 or self.commitment.num_clusters == 0:
                 return []
@@ -277,7 +278,7 @@ class VectorStore:
         Returns `{"clusters", "chunks"}`: the entry of each requested cluster,
         and the chunks of all of them sorted best first.
         """
-        with self._lock:
+        with self.lock:
             self._require_committed()
             q = self._query_vector(query_vec)
             wanted = list(dict.fromkeys(int(c) for c in cluster_ids))

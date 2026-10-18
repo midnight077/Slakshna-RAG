@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phase M1 done (2026-10-18); M2–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M2 done (2026-10-18); M3–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -481,7 +481,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 ## 13. Status checklist
 
 - [x] Phase M1 — clustering and Merkle tree in the store (done 2026-10-18; see section 14)
-- [ ] Phase M2 — sidecar routes
+- [x] Phase M2 — sidecar routes (done 2026-10-18; see section 14)
 - [ ] Phase M3 — Rust verification library
 - [ ] Phase M4 — wire protocol v2 and own signed root
 - [ ] Phase M5 — root registry and stale-peer skipping
@@ -509,3 +509,28 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J2–J8
 - FAISS's "too few points per centroid" warning is turned off with `min_points_per_centroid=1`. That setting only controls the warning, not the result.
 - `search()` without proofs returns exactly what it did before; the internal `cluster` field is removed from its results. With proofs it returns `{"chunks", "clusters"}`, the same shape as `search_clusters`.
 
+### Phase M2 (2026-10-18, machine 1)
+
+Done: `/commitment`, `/embed`, `/centroids`, `/search_clusters`, `/retrieve` with `with_proofs`, `commitment` in `/health`, and `root_version` in `/ingest`. New `tests/test_rag_server.py` tests the routes in-process (FastAPI test client, fake embedder).
+
+Check, against the real sidecar on the M1 scratch index (161 chunks, 13 clusters, root `802f7d37…`):
+- The three Python test files pass: 46 tests.
+- `/centroids` with `n = 3` for three `node1_only` questions. The best cluster, by the asker's own `dot(q, centroid)`, is the right topic every time:
+
+  | Question | Best clusters (asker's similarity) | Documents in the best cluster |
+  | :-- | :-- | :-- |
+  | q01 Chandrayaan-3 landing date | 1 (0.740), 4 (0.730), 0 (0.665) | Chandrayaan-2 ×7, Chandrayaan-3 ×3 |
+  | q03 Mars Orbiter Mission name | 5 (0.720), 4 (0.532), 1 (0.495) | Mars Orbiter Mission ×12 |
+  | Aditya-L1, what it studies | 2 (0.395), 10 (0.330), 11 (0.291) | Aditya-L1 ×16, Mars Orbiter ×1 |
+
+- `/search_clusters` on each best cluster returned 3 on-topic chunks (scores 0.47–0.77).
+- An independent script (only `hashlib`/`struct`, no `rag/` imports) folded every returned proof to the `/commitment` root: 29 of 29 for 9 centroids, the cluster entries, 9 chunks from `/search_clusters` and 5 from `/retrieve` with proofs. Each chunk with one character added was rejected.
+- A stale `root_version` gets HTTP 409, `{"detail": {"error": "stale_root", "root": <current commitment>}}`. `/ingest` of one new document returned a new `root_version` and the root changed. The old version then got 409, and ingesting the same document again changed nothing.
+- `cargo test --release` still passes. No Rust changed.
+
+Observed, relevant for M6/M8: for q01 the cluster with the best centroid (1, 0.740) is not the one with the best chunk. Cluster 4 has a lower centroid similarity (0.730) but a better chunk (0.807 against 0.769). This is the case D6 and `select_by = "best_chunk"` were meant for. With `max_clusters = 5`, both clusters would be selected.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, J9–J11):
+- The store's lock is public (`store.lock`). Routes that report a `root_version` hold it while reading the version and the results, so the two always match. The query is embedded before the lock is taken.
+- The plan fixed the 409 body only for the peer protocol. On the sidecar it is `{"detail": {"error": "stale_root", "root": <commitment summary>}}`, so Rust can update its own view without a second request.
+- An unknown cluster id gets HTTP 400. A negative `n` or `per_cluster` gets 422 (FastAPI's validation error).

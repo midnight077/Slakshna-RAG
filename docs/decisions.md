@@ -172,6 +172,10 @@ Each peer's outcome (`ok`, `timeout` or `error`) appears in the reply's `peers` 
 **I4. Record every decision in this file (User, 2026-10-18).**
 *Why:* so the reasons behind the design can be looked up later.
 
+**I5. Leave the existing Rust code unformatted; run `rustfmt` only on new files (User, 2026-10-18).**
+The committed Rust files use a `{ A, B }` brace style that `cargo fmt` would rewrite. They stay as they are. New files (from `src/rag/merkle.rs` on) are checked with `rustfmt --check <file>`, and edits to old files match the code around them. `cargo fmt --check` over the whole tree is no longer a required check.
+*Why:* the user chose not to reformat. Reformatting would touch every Rust file and bury the real changes in the diff.
+
 ## J. Verifiable, cluster-routed retrieval (Merkle tree and k-means)
 
 **J1. Follow the plan in `merkle_tree.md`, including its decisions D1–D10 and its byte format (User, 2026-10-18).**
@@ -204,3 +208,14 @@ The stored `cluster` field is removed from plain search results. Cluster ids and
 **J8. Asking for proofs of chunks that are not yet committed is an error (Claude, 2026-10-18).**
 *Why:* such chunks are not in the root, so no valid proof exists. Failing loudly is better than returning proofs that would fail on the peer.
 
+**J9. Sidecar routes read the root version and the results under one lock (Claude, 2026-10-18).**
+The store's lock is public. `/centroids`, `/search_clusters`, `/retrieve` with proofs and `/ingest` hold it while they read both. The query is embedded before the lock is taken.
+*Why:* an ingest landing between the two reads would make a reply claim one root version while carrying proofs for another, and the asker would reject good data.
+
+**J10. A stale `root_version` on `/search_clusters` gets HTTP 409 with the current commitment (Claude, 2026-10-18).**
+The body is `{"detail": {"error": "stale_root", "root": {root, version, num_chunks, num_clusters, dim, embedding_model}}}`.
+*Why:* cluster numbers change whenever the index is re-clustered, so serving an old cluster id would return the wrong chunks. Including the current commitment lets the Rust responder answer `stale_root` with the new root in one step, as section 5 of the plan requires.
+
+**J11. Route tests run in-process with FastAPI's test client (Claude, 2026-10-18).**
+`tests/test_rag_server.py` uses the fake embedder from the store tests.
+*Why:* it checks every route, including the proofs, in about a second, with no model download, port or running server. `httpx`, which the test client needs, is already in `requirements-rag.txt`.
