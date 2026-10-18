@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **plan only, no code implemented.** Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phase M1 done (2026-10-18); M2–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -480,7 +480,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 
 ## 13. Status checklist
 
-- [ ] Phase M1 — clustering and Merkle tree in the store
+- [x] Phase M1 — clustering and Merkle tree in the store (done 2026-10-18; see section 14)
 - [ ] Phase M2 — sidecar routes
 - [ ] Phase M3 — Rust verification library
 - [ ] Phase M4 — wire protocol v2 and own signed root
@@ -488,3 +488,24 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [ ] Phase M6 — two-round query and flat mode
 - [ ] Phase M7 — simulated adversaries
 - [ ] Phase M8 — evaluation
+
+## 14. Results
+
+### Phase M1 (2026-10-18, machine 1)
+
+Done: `rag/clustering.py`, `rag/merkle.py`, the store changes from 3.3, `scripts/rag_merkle_vectors.py`, `tests/fixtures/merkle_vectors.json`, `tests/test_rag_merkle.py`, and new tests in `tests/test_rag_store.py`.
+
+Check:
+- `.venv-rag/bin/python -m unittest tests/test_rag_store.py tests/test_rag_merkle.py`: 38 tests pass (5 runs in a row, to rule out k-means flakiness).
+- `rag_engine.py ingest --path corpus/node1` into an empty index: 161 chunks in **13 clusters**, sizes 15, 10, 17, 7, 15, 12, 14, 2, 11, 13, 4, 34, 7. It took 13.6 s, most of it loading the model. Root `802f7d37…`.
+- The sidecar was started, stopped and started again on that index. It logged the same root and version both times, and `/retrieve` still worked.
+- Copies of the existing `data-rag-node1` and `data-rag-node2` indexes (built before clustering) are migrated once on load. Node 1 gets the **same root** as the fresh ingest (`802f7d37…`), so clustering is repeatable on this machine. Node 2 has 174 chunks in 13 clusters, root `5172ade3…`. The real `data-rag-node*` folders were not touched; they migrate by themselves the next time a node starts.
+- `cargo test --release` still passes (6 tests). `cargo fmt --check` fails, but on Rust code that was already committed before M1 (every file, from its `{ A, B }` brace style). M1 changes no Rust.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, J2–J8):
+- `rag/server.py` changed already in M1. Its `/ingest` with `documents` now calls the new `add_documents`, which adds and then commits once. Without that change, documents ingested this way would never be saved, because `add_document` no longer saves.
+- `meta.json`'s `commitment` also stores `n_clusters_setting`. If the configured `n_clusters` differs on the next load, the store re-clusters and the version goes up. This is so the M8 sweep only needs a restart.
+- `rag_engine.py` has `--n-clusters` now (both `ingest` and `serve`), and its startup log shows the cluster count, root and version. `sidecar.rs` passes nothing yet; that comes with the config in M6.
+- FAISS's "too few points per centroid" warning is turned off with `min_points_per_centroid=1`. That setting only controls the warning, not the result.
+- `search()` without proofs returns exactly what it did before; the internal `cluster` field is removed from its results. With proofs it returns `{"chunks", "clusters"}`, the same shape as `search_clusters`.
+

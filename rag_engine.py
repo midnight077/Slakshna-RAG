@@ -21,14 +21,20 @@ def open_store(args):
 
     print(f"Loading embedding model {args.embedding_model}...", file=sys.stderr)
     embedder = Embedder(args.embedding_model)
-    return VectorStore(os.path.join(args.data_dir, "rag"), embedder)
+    return VectorStore(os.path.join(args.data_dir, "rag"), embedder, n_clusters=args.n_clusters)
+
+
+def describe_commitment(store):
+    summary = store.commitment_summary()
+    return (f"{summary['num_clusters']} clusters, Merkle root {summary['root'][:16]}… "
+            f"(version {summary['version']})")
 
 
 def cmd_ingest(args):
     store = open_store(args)
     added = store.add_path(args.path)
     print(f"Added {added} chunks; index now holds {store.num_chunks} chunks "
-          f"from {len(store.documents)} documents.", file=sys.stderr)
+          f"from {len(store.documents)} documents in {describe_commitment(store)}.", file=sys.stderr)
 
 
 def exit_when_parent_dies():
@@ -57,7 +63,8 @@ def cmd_serve(args):
         exit_when_parent_dies()
     store = open_store(args)
     generator = make_generator(args.generator, args.generator_url, args.generator_model)
-    print(f"Index holds {store.num_chunks} chunks; generator: {generator.name} "
+    print(f"Index holds {store.num_chunks} chunks in {describe_commitment(store)}; "
+          f"generator: {generator.name} "
           f"({generator.model}).", file=sys.stderr)
     uvicorn.run(create_app(store, generator), host="127.0.0.1", port=args.port, log_level="warning")
 
@@ -67,6 +74,8 @@ def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", required=True, help="the node's data_dir; the index is stored in <data-dir>/rag/")
     common.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    common.add_argument("--n-clusters", type=int, default=0,
+                        help="k-means clusters to group chunks into; 0 = round(sqrt(number of chunks))")
     sub = parser.add_subparsers(dest="command", required=True)
 
     ingest = sub.add_parser("ingest", parents=[common], help="add documents to the index")

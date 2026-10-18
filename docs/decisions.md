@@ -7,7 +7,7 @@ Every design or working decision made on the peer-to-peer RAG work, with the rea
 
 If a decision is later changed, keep the old entry, mark it **Replaced**, and point to the new entry, so the history stays readable.
 
-The full design is in `p2p_rag_plan.md`; this file only records the choices and why they were made.
+The full design is in `p2p_rag_plan.md` and, for verifiable cluster-routed retrieval, `merkle_tree.md`; this file only records the choices and why they were made.
 
 ## A. Scope and approach
 
@@ -171,3 +171,36 @@ Each peer's outcome (`ok`, `timeout` or `error`) appears in the reply's `peers` 
 
 **I4. Record every decision in this file (User, 2026-10-18).**
 *Why:* so the reasons behind the design can be looked up later.
+
+## J. Verifiable, cluster-routed retrieval (Merkle tree and k-means)
+
+**J1. Follow the plan in `merkle_tree.md`, including its decisions D1–D10 and its byte format (User, 2026-10-18).**
+*Why:* the user approved that plan. Its decision table is not repeated here. The entries below are choices made while implementing it.
+
+**J2. The store keeps its lock for a whole ingest: all the adds, then one commit (Claude, 2026-10-18).**
+`add_documents` (used by `add_path` and by the sidecar's `/ingest`) holds a re-entrant lock while it adds every document and commits. If a document fails partway, whatever was already added is still committed.
+*Why:* a query arriving mid-ingest would otherwise see new chunks that have no cluster and no proof yet. Committing on failure keeps memory and disk the same.
+
+**J3. Changing `n_clusters` re-clusters the index on the next start (Claude, 2026-10-18).**
+`meta.json` stores the `n_clusters` setting used. A different value at load time triggers a new commit (new root, higher version).
+*Why:* the evaluation sweeps `n_clusters`. Without this, a new value would only take effect after the next document was added.
+
+**J4. Switch off FAISS's "too few training points" warning (Claude, 2026-10-18).**
+`min_points_per_centroid=1` in `faiss.Kmeans`.
+*Why:* with about 160 chunks and 13 clusters the warning would be printed on every ingest, and it is expected here. The setting only controls the warning; the clustering is unchanged.
+
+**J5. On load, a Merkle root that does not match `meta.json` stops the sidecar; files written before clustering are migrated once (Claude, 2026-10-18).**
+`meta.json` is written last when saving. An index with no `commitment` entry is clustered and committed on load.
+*Why:* a mismatch means the files were edited or a save was cut short. Serving them would sign a root over content nobody committed to. Old indexes have nothing to check against, so they are upgraded instead of rejected.
+
+**J6. The Merkle fixture stores centroids as hex bytes and includes non-ASCII and empty texts (Claude, 2026-10-18).**
+The float values are in the file only for reading; the hex is what is hashed. A test checks that the generator script reproduces the committed fixture exactly.
+*Why:* a value like 0.6 can round differently when parsed from decimal in another language, and multi-byte UTF-8 is where byte-length bugs show up. The generator check means the fixture can't drift from the code without a test failing.
+
+**J7. The `/retrieve` output stays exactly as before (Claude, 2026-10-18).**
+The stored `cluster` field is removed from plain search results. Cluster ids and proofs only appear when they are asked for (`with_proofs`, `search_clusters`).
+*Why:* the Rust node and the v1 peer protocol read these results, and nothing in M1 should change what they get.
+
+**J8. Asking for proofs of chunks that are not yet committed is an error (Claude, 2026-10-18).**
+*Why:* such chunks are not in the root, so no valid proof exists. Failing loudly is better than returning proofs that would fail on the peer.
+

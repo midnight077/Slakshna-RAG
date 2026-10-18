@@ -39,7 +39,8 @@ python ml_engine.py <my_id> <peer_id...>            # one ML epoch with no netwo
 # RAG sidecar (Python, separate environment from Bhaskera)
 uv venv .venv-rag --python 3.11
 uv pip install --python .venv-rag/bin/python --torch-backend cpu -r requirements-rag.txt
-.venv-rag/bin/python -m unittest tests/test_rag_store.py
+.venv-rag/bin/python -m unittest tests/test_rag_store.py tests/test_rag_merkle.py
+.venv-rag/bin/python scripts/rag_merkle_vectors.py    # rewrite tests/fixtures/merkle_vectors.json; only when the Merkle format changes on purpose
 .venv-rag/bin/python rag_engine.py ingest --data-dir ./data-rag-node1 --path corpus/node1
 .venv-rag/bin/python rag_engine.py serve --data-dir ./data-rag-node1 --port 8600   # needs Ollama running
 

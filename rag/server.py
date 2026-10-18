@@ -73,7 +73,7 @@ def create_app(store, generator):
             if request.path is not None:
                 added = store.add_path(request.path)
             else:
-                added = sum(store.add_document(doc.id, doc.text) for doc in request.documents)
+                added = store.add_documents((doc.id, doc.text) for doc in request.documents)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"added_chunks": added, "num_chunks": store.num_chunks}
