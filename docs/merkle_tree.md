@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M5 done; M6 implemented and checked on one machine (2026-10-19), two-machine run pending; M7–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M6 done (M6 on 2026-10-19); M7–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -485,7 +485,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M3 — Rust verification library (done 2026-10-18; see section 14)
 - [x] Phase M4 — wire protocol v2 and own signed root (done 2026-10-18; see section 14)
 - [x] Phase M5 — root registry and stale-peer skipping (done 2026-10-18; see section 14)
-- [ ] Phase M6 — two-round query and flat mode (in progress: implemented, single-machine check done 2026-10-19; the two-machine run is still to do; see section 14)
+- [x] Phase M6 — two-round query and flat mode (done 2026-10-19, on one machine and across both; see section 14)
 - [ ] Phase M7 — simulated adversaries
 - [ ] Phase M8 — evaluation
 
@@ -628,7 +628,7 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J19–J
 - `skipped_stale` (from 6.4) is reported already.
 - A rollback is flagged without keeping evidence. Equivocation compares the signed fields, not the signature bytes. Each flag is listed once, and evidence is not duplicated.
 
-### Phase M6 (2026-10-19) — single-machine part; two-machine run pending
+### Phase M6 (2026-10-19)
 
 Done:
 - `src/rag/retrieval.rs` (new) has the two-round pipeline (6.2) and the flat pipeline (6.3), with shared checks. The pure parts are separate functions with unit tests: `select_clusters`, `check_chunks`, `apply_rescore` and `overclaimed`.
@@ -664,7 +664,19 @@ Selection with a third node (temporary, on machine 1, indexing node 1's document
 - Round 2 skips a peer only when its clusters lose. With 2 peers × `centroids_per_peer = 3` = 6 candidates for `max_clusters = 5`, and MiniLM giving unrelated topics cosines above `min_centroid_score = 0.2`, both peers nearly always win something. This is what D4 warned about, and what the M8 sweep of `max_clusters` and `min_centroid_score` is for.
 - A fresh index of `corpus/node1` on node 3 had the same root as node 1 (`802f7d37…`), so the commitment is deterministic for the same documents on the same machine.
 
-Still to do for M6: the same 15 questions with node 2 on machine 2 (Phase 4 setup), in both modes.
+Two machines (Phase 4 setup): node 1 on machine 1 (`examples/rag-2node/node1.toml`, unchanged); node 2 on machine 2 at `c8b37dc`, reached over the VPN at its pinned address (`313823…@192.168.3.143:9001`). Machine 1's local test nodes were not running, and node 1 skipped them as `failing`.
+- Machine 2's first attempt failed with "peer doesn't support any known protocol". It was still on the M1 build, because the branch had not been pushed. After the push, a rebuild and a restart, `hello` returned its root `64ecc151…` (174 chunks, 13 clusters; machine 2's own index, migrated on that start) in 8 ms, with `signature_valid = true`. The independent Python `cryptography` check agreed.
+- All 15 questions in both modes. The answers and scores were identical to the one-machine run:
+
+| Type | two_round | flat |
+| :-- | :-- | :-- |
+| `node1_only` | 6 / 6 | 6 / 6 |
+| `node2_only` | **6 / 6** | **6 / 6** |
+| `cross_node` | 0 / 3 (the same wrong answers as on one machine) | 0 / 3 |
+
+- Every remote context was `verified` (35 in two_round, 36 in flat), all from machine 2's node (`slakshna19yp80…`). 0 chunks were rejected and no flags were raised. Round 2 went to exactly the peers with `selected_clusters`.
+- Round trips over the VPN: round 1 (or the flat round) had a median of 33 ms (range 21–68 ms); round 2 had a median of 23 ms. Median `peer_retrieve`: 417 ms in two_round (select 40, fetch 24, rescore 359) and 240 ms in flat (fetch 37, rescore 202). These are almost the same as on one machine, because local re-embedding dominates, not the network.
+- Not tested yet: node 2 on machine 2 asking node 1 (the reverse direction), and the relay path. Both were also left open in Phase 4.
 
 Differences from the plan, and additions (logged in `docs/decisions.md`, J24–J31):
 - The pipelines live in a new `src/rag/retrieval.rs` instead of `src/rag/mod.rs`.
