@@ -53,7 +53,7 @@ The sidecar never talks to the network. All peer traffic goes through Rust and I
 | Part | Choice for v1 | Why |
 | :-- | :-- | :-- |
 | Embedding model | `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions) | Small, fast on CPU, widely used baseline. |
-| Vector store | FAISS `IndexFlatIP` over normalised vectors (exact cosine search) | Exact results, no tuning, fine up to roughly 10^5–10^6 chunks. |
+| Vector store | FAISS `IndexFlatIP` over normalised vectors (exact cosine search). **Since 2026-10-21: FAISS HNSW (`IndexHNSWFlat`, inner product), decision C10.** | Exact results, no tuning, fine up to roughly 10^5–10^6 chunks. |
 | Document loading | PDF via `pypdf`, plus `.txt` and `.md` | The test corpus is PDF. |
 | Chunk metadata | `chunks.jsonl` next to the index | Readable, easy to debug. |
 | Chunking | Fixed windows of about 200 words with 40 words of overlap | Simplest reasonable default. |

@@ -47,7 +47,7 @@ Phase 0 networking, 1 Python helper alone, 2 one node, 3 two nodes on one machin
 **C1. Embedding model `sentence-transformers/all-MiniLM-L6-v2` (Claude, 2026-10-11).**
 *Why:* small (about 90 MB), fast on a CPU, and a widely used baseline. The machines have no GPUs.
 
-**C2. Vector store: FAISS `IndexFlatIP` over normalised vectors (Claude, 2026-10-11).**
+**C2. Vector store: FAISS `IndexFlatIP` over normalised vectors (Claude, 2026-10-11).** **Replaced** by C10.
 *Why:* exact search with nothing to tune, fast enough up to hundreds of thousands of chunks. Normalised vectors make the score a cosine similarity, which is comparable between nodes (see D1).
 
 **C3. Chunks of about 200 words with 40 words of overlap (Claude, 2026-10-11).**
@@ -70,6 +70,10 @@ Phase 0 networking, 1 Python helper alone, 2 one node, 3 two nodes on one machin
 
 **C9. Separate Python environment `.venv-rag`, made with `uv`, with the CPU-only build of PyTorch (Claude, 2026-10-12).**
 *Why:* keeps the RAG libraries apart from the Bhaskera training environment, so neither breaks the other. The CPU build of PyTorch is several GB smaller than the GPU build, which matters on machine 1's nearly full disk.
+
+**C10. Vector store: FAISS HNSW (`IndexHNSWFlat`, inner product) instead of exact search (User, 2026-10-21; settings by Claude).** Replaces C2.
+The settings are `M = 32`, `efConstruction = 200` and `efSearch = 128`, as constants in `rag/store.py`. An index saved in the old exact format is rebuilt as HNSW from the same vectors when it is loaded, once, and saved.
+*Why:* the user asked for HNSW, which searches a graph instead of comparing the query with every chunk, so it stays fast as corpora grow. The settings are generous for corpora of a few hundred chunks: on both real indexes, HNSW returned the same top 5 as exact search for all 365 test queries, and a two-node run of all 15 questions in both modes gave the same contexts, in the same order, as with exact search. Search time is about 0.1 ms per query either way at this size. The Merkle root does not cover the index file, and cluster scoring (`/centroids`, `/search_clusters`) works on the stored vectors, so roots, proofs and two-round selection are unaffected. The settings are not in the config, because nothing needs to tune them yet; that can change for large corpora in the evaluation.
 
 ## D. Combining results from several nodes
 

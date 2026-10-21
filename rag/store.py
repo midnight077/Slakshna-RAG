@@ -1,7 +1,8 @@
 """On-disk vector store: a FAISS index plus the chunk text it points at.
 
 Layout under `directory`:
-    index.faiss    exact inner-product index over unit vectors (= cosine similarity)
+    index.faiss    HNSW graph index over unit vectors, scored by inner product
+                   (= cosine similarity); approximate nearest-neighbour search
     chunks.jsonl   one JSON object per chunk, in the same order as the index;
                    each names the k-means cluster it belongs to
     centroids.npy  float32 [k, dim], one unit-length centroid per cluster
@@ -28,6 +29,22 @@ from .clustering import choose_k, cluster
 from .loaders import list_documents, load_document
 from .merkle import Commitment
 
+# HNSW settings. M: graph neighbours per vector. efConstruction: candidates
+# examined while building the graph. efSearch: candidates examined per query;
+# higher is closer to exact search and slower. All three are far above what a
+# corpus of a few hundred chunks needs, so results match exact search there.
+HNSW_M = 32
+HNSW_EF_CONSTRUCTION = 200
+HNSW_EF_SEARCH = 128
+
+
+def new_index(dim):
+    """An empty HNSW index that ranks by inner product."""
+    index = faiss.IndexHNSWFlat(dim, HNSW_M, faiss.METRIC_INNER_PRODUCT)
+    index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
+    index.hnsw.efSearch = HNSW_EF_SEARCH
+    return index
+
 
 class VectorStore:
     def __init__(self, directory, embedder, n_clusters=0):
@@ -36,7 +53,7 @@ class VectorStore:
         self.directory = directory
         self.embedder = embedder
         self.n_clusters = n_clusters
-        self.index = faiss.IndexFlatIP(embedder.dim)
+        self.index = new_index(embedder.dim)
         self.vectors = np.zeros((0, embedder.dim), dtype=np.float32)
         self.chunks = []
         self.documents = {}  # source name -> sha256 of the document text
@@ -72,6 +89,17 @@ class VectorStore:
                              f"{self.index.ntotal} vectors, {len(self.chunks)} chunks")
         if self.index.ntotal:
             self.vectors = self.index.reconstruct_n(0, self.index.ntotal)
+        if isinstance(self.index, faiss.IndexHNSWFlat):
+            self.index.hnsw.efSearch = HNSW_EF_SEARCH
+        else:
+            # Built before the switch to HNSW (an exact IndexFlatIP). Rebuild it
+            # from the same vectors; chunks, clusters and the Merkle root are
+            # unaffected, because the root does not cover the index file.
+            print(f"Index in {self.directory} uses exact search; rebuilding it as HNSW.", file=sys.stderr)
+            self.index = new_index(self.embedder.dim)
+            if len(self.vectors):
+                self.index.add(np.ascontiguousarray(self.vectors, dtype=np.float32))
+            faiss.write_index(self.index, self._path("index.faiss"))
 
         committed = meta.get("commitment")
         if committed is None:

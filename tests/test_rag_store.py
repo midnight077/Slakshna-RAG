@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 
+import faiss
 import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -17,7 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from rag.chunking import chunk_text
 from rag.clustering import choose_k
 from rag.merkle import ZERO_HASH, cluster_hash, fold_proof, leaf_hash
-from rag.store import VectorStore
+from rag.store import HNSW_EF_SEARCH, VectorStore
 
 KEYWORDS = ["moon", "mars", "rhino", "river"]
 
@@ -286,6 +287,44 @@ class ClusteredStoreTests(unittest.TestCase):
         self.assertEqual((summary["version"], summary["num_clusters"], summary["num_chunks"]), (0, 0, 0))
         self.assertEqual(empty.nearest_centroids(self.query("moon"), 3), [])
         self.assertEqual(empty.search("moon", 3, with_proofs=True), {"chunks": [], "clusters": []})
+
+
+class HnswIndexTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = VectorStore(self.tmp.name, FakeEmbedder())
+        self.store.add_documents(CLUSTER_DOCS.items())
+
+    def test_new_index_is_hnsw_with_inner_product(self):
+        self.assertIsInstance(self.store.index, faiss.IndexHNSWFlat)
+        self.assertEqual(self.store.index.metric_type, faiss.METRIC_INNER_PRODUCT)
+        reloaded = VectorStore(self.tmp.name, FakeEmbedder())
+        self.assertIsInstance(reloaded.index, faiss.IndexHNSWFlat)
+        self.assertEqual(reloaded.index.hnsw.efSearch, HNSW_EF_SEARCH)
+
+    def test_search_matches_exact_search(self):
+        for query in ["moon", "mars rover", "rhino river", "river", "notes"]:
+            q = FakeEmbedder().embed([query])[0]
+            exact = sorted((self.store.vectors @ q).tolist(), reverse=True)[:4]
+            found = [c["score"] for c in self.store.search(query, top_k=4)]
+            np.testing.assert_allclose(found, exact, rtol=1e-5, err_msg=query)
+
+    def test_exact_index_from_before_hnsw_is_rebuilt_on_load(self):
+        before = self.store.commitment_summary()
+        expected = [c["chunk_id"] for c in self.store.search("rhino", top_k=3)]
+        # Write the same vectors in the old exact format.
+        flat = faiss.IndexFlatIP(FakeEmbedder.dim)
+        flat.add(self.store.vectors)
+        faiss.write_index(flat, os.path.join(self.tmp.name, "index.faiss"))
+
+        rebuilt = VectorStore(self.tmp.name, FakeEmbedder())
+        self.assertIsInstance(rebuilt.index, faiss.IndexHNSWFlat)
+        np.testing.assert_array_equal(rebuilt.vectors, self.store.vectors)
+        self.assertEqual(rebuilt.commitment_summary(), before)
+        self.assertEqual([c["chunk_id"] for c in rebuilt.search("rhino", top_k=3)], expected)
+        # The rebuilt index was saved, so the next load needs no rebuild.
+        self.assertIsInstance(faiss.read_index(os.path.join(self.tmp.name, "index.faiss")), faiss.IndexHNSWFlat)
 
 
 if __name__ == "__main__":

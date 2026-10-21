@@ -123,7 +123,7 @@ This happens when documents are ingested, usually at node startup (`corpus_dir` 
 
 ### 4.1 Steps
 
-1. **Chunk and embed** (unchanged from before). Each new document is split into chunks of about 200 words, and each chunk gets an embedding. The embeddings go into the FAISS index (the search structure) and also into an in-memory array `vectors`.
+1. **Chunk and embed** (unchanged from before). Each new document is split into chunks of about 200 words, and each chunk gets an embedding. The embeddings go into the FAISS index (the search structure) and also into an in-memory array `vectors`. The index is an **HNSW** index: a graph linking each embedding to its nearest neighbours, which search follows instead of comparing the query with every chunk. It is approximate in principle, but with its settings (`M = 32`, `efConstruction = 200`, `efSearch = 128`) it returned exactly the same top 5 as exact search for all 365 test queries on both nodes. Only the plain top-k search (local retrieval, flat mode, `/retrieve`) uses it. Cluster scoring works directly on `vectors`, and the Merkle root does not cover the index file.
 2. **Cluster** (`rag/clustering.py`). After all new documents are added, **all** chunks are clustered again, not just the new ones.
    - The number of clusters is `k = round(√number_of_chunks)`, kept between 1 and 64, unless `n_clusters` is set in the config. For node 1's 161 chunks, `k = 13`.
    - FAISS k-means runs with `spherical=True`, so centroids have length 1 and `dot(query, centroid)` is a cosine similarity.
@@ -138,7 +138,7 @@ Re-ingesting a document that is already in the index does nothing: no new cluste
 
 | File | Content |
 | :-- | :-- |
-| `index.faiss` | The FAISS search index (all chunk embeddings). |
+| `index.faiss` | The FAISS HNSW search index (all chunk embeddings and the neighbour graph). |
 | `chunks.jsonl` | One line per chunk: `chunk_id`, `source`, `text`, and now `cluster`. |
 | `centroids.npy` | The centroids, a `[k, 384]` array of 32-bit floats. |
 | `meta.json` | Embedding model, dimension, ingested documents, and now `commitment`: `root`, `version`, `num_clusters`, `n_clusters_setting`. |
@@ -151,6 +151,7 @@ When the sidecar starts, it rebuilds the Merkle tree from `chunks.jsonl` and `ce
 - **They differ:** it refuses to start with `index files in … were changed on disk`. Someone edited the files, or a save was cut short. To fix it, delete the `rag/` folder and ingest again.
 - **`meta.json` has no `commitment`:** the index was built before this work. It is clustered and committed once, and the sidecar logs `Index in … predates clustering; clustering it now.`
 - **`n_clusters` differs from the stored `n_clusters_setting`:** the index is re-clustered, and you get a new root and version.
+- **`index.faiss` is in the old exact format (`IndexFlatIP`):** it is rebuilt as HNSW from the same vectors and saved, and the sidecar logs `Index in … uses exact search; rebuilding it as HNSW.` The root and version do not change.
 
 ---
 
@@ -669,12 +670,12 @@ The node refuses to start if a value is out of range, for example `max_clusters 
 .venv-rag/bin/python -m unittest tests/test_rag_store.py tests/test_rag_merkle.py tests/test_rag_server.py
 ```
 
-46 tests, about 2 s, with no model download: a fake embedder counts keywords instead.
+49 tests, about 2 s, with no model download: a fake embedder counts keywords instead.
 
 | File | Checks |
 | :-- | :-- |
 | `test_rag_merkle.py` | The code reproduces the fixture exactly. Leaf, inner and cluster hashes and the signed-message bytes are recomputed by hand with `hashlib` and compared. Proofs fold to the root for trees of 1–33 leaves. A changed text or one flipped centroid bit fails. |
-| `test_rag_store.py` | Clusters are numbered without gaps and cover every chunk. Every proof folds to the root. The root survives a reload. Hand-edited `chunks.jsonl` or `centroids.npy` stops loading. A new document changes root and version; re-ingesting changes nothing. Old indexes are migrated. Changing `n_clusters` re-clusters. The empty index has the zero root. |
+| `test_rag_store.py` | The index is HNSW with inner-product scoring, its results match exact search, and an old exact index is rebuilt on load with the same root. Clusters are numbered without gaps and cover every chunk. Every proof folds to the root. The root survives a reload. Hand-edited `chunks.jsonl` or `centroids.npy` stops loading. A new document changes root and version; re-ingesting changes nothing. Old indexes are migrated. Changing `n_clusters` re-clusters. The empty index has the zero root. |
 | `test_rag_server.py` | Every sidecar route, in-process: proofs from `/centroids`, `/search_clusters` and `/retrieve` fold to the root; a stale version gets HTTP 409; `/ingest` reports the new version. |
 
 ### 12.2 Rust tests (node)
@@ -721,6 +722,7 @@ These are not automated; they were run by hand for each phase and are recorded i
 | M3 | Python and Rust agree on every byte of the fixture. |
 | M4 | Signed roots verify across nodes (3–8 ms per `hello`), and with an independent library. A new root after ingest reached the peer at once. |
 | M5 | With a dead remembered peer, peer retrieval fell from 5001 ms to about 30 ms after the first refresh. With rule J23, a peer that just died costs one timed-out question. |
+| HNSW switch (decision C10) | Same top 5 as exact search for all 365 test queries on both indexes. All 15 questions in both modes gave the same contexts, in the same order; `node2_only` still 6/6, every remote context `verified`. Roots unchanged. |
 | M6 | 15 questions, both modes, one machine and two machines: `node1_only` 6/6, `node2_only` 6/6, `cross_node` 0/3. Every remote context `verified`, no flags. Peer work about 0.4 s (two_round) or 0.24 s (flat), mostly re-embedding; VPN round trips 21–68 ms. |
 
 Two observations to carry into M8:
