@@ -17,6 +17,7 @@ Related docs:
 - `docs/p2p_rag_plan.md` — the implementation plan for the peer-to-peer RAG pipeline. **Read it before doing any RAG work** and keep its status checklist up to date.
 - `docs/decisions.md` — log of every design and working decision, with its reason. **Add an entry whenever you make or change a decision** (see "Recording decisions" below).
 - `docs/merkle_tree.md` — plan for verifiable, cluster-routed retrieval (k-means centroids, Merkle roots, two-round peer queries). **Read it before changing the RAG store or peer protocol** and keep its status checklist up to date.
+- `docs/explanation_merkle_tree.md` — plain-language explanation of what was built from that plan: data flow, byte formats, commands, how to read every output, tests and results.
 - `docs/AGENTS.md` — existing repository guidelines (style, commits, testing).
 - `docs/delta_wire_format.md` — the sparse int8 delta format.
 - `walkthrough280726.md` — step-by-step description of one training epoch inside `ml_engine.py`.
@@ -31,7 +32,7 @@ bash setup.sh                                # Python deps, runtime dirs, releas
 cargo check                                  # fast validation of Rust changes
 cargo build --release                        # produces target/release/iiitd
 cargo test --release                         # Rust unit tests (identity.rs, rag/mod.rs, rag/merkle.rs incl. the shared Merkle fixture, rag/protocol.rs, rag/registry.rs); --release reuses the built dependencies
-rustfmt --edition 2021 --check src/rag/merkle.rs src/rag/registry.rs   # new Rust files only; existing files are not rustfmt-formatted (decision I5)
+rustfmt --edition 2021 --check src/rag/merkle.rs src/rag/registry.rs src/rag/retrieval.rs   # new Rust files only; existing files are not rustfmt-formatted (decision I5)
 
 python -m unittest tests/test_delta_transport.py   # delta wire-format tests (needs torch)
 python ml_engine.py <my_id> <peer_id...>            # one ML epoch with no networking
