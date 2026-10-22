@@ -182,6 +182,9 @@ pub enum Retrieval {
     TwoRound,
     /// One round: every peer sends its best chunks. The evaluation baseline.
     Flat,
+    /// Clusters are chosen locally from a verified copy of every peer's
+    /// centroids; only round 2 goes over the network. Needs `directory = true`.
+    Directory,
 }
 
 /// What round 1 ranks clusters by.
@@ -426,6 +429,9 @@ impl Config {
         }
         if rag.n_clusters > 64 {
             return Err("rag.n_clusters must be at most 64 (0 = automatic)".into());
+        }
+        if rag.retrieval == Retrieval::Directory && !rag.directory {
+            return Err("rag.retrieval = \"directory\" needs rag.directory = true".into());
         }
         Ok(config)
     }

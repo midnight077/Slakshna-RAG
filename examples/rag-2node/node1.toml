@@ -28,6 +28,7 @@ python = ".venv-rag/bin/python"
 corpus_dir = "corpus/node1"  # Documents this node indexes at startup
 generator = "ollama"        # "none" returns the retrieved passages without writing an answer
 generator_model = "qwen2.5:1.5b"
+directory = true            # Serve and use the centroid directory, so "directory" mode works per query
 
 [discovery]
 mdns = true                 # Find other nodes on the same local network automatically

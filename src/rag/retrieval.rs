@@ -23,6 +23,7 @@ use crate::config::SelectBy;
 use crate::history::BoxError;
 use iroh::EndpointId;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -48,6 +49,8 @@ pub struct RemoteRetrieval {
     /// Round 2, or the single round of flat mode.
     pub fetch_ms: u64,
     pub rescore_ms: u64,
+    /// Notes about the whole query, e.g. "select_by_centroid_for_directory".
+    pub flags: Vec<String>,
 }
 
 /// One cluster offered in round 1 whose proof checked out.
@@ -218,6 +221,8 @@ struct PeerState {
     chunks: Vec<Chunk>,
     /// Bytes exchanged with this peer during this query.
     bytes: ByteCount,
+    /// Round 2 found the peer on a newer root than the one its clusters came from.
+    stale: bool,
 }
 
 impl PeerState {
@@ -233,6 +238,7 @@ impl PeerState {
             answered: false,
             chunks: Vec::new(),
             bytes: ByteCount::default(),
+            stale: false,
         }
     }
 
@@ -420,6 +426,7 @@ impl RagService {
             )
             .await;
         state.result.round1_ms = Some(ms);
+        state.result.selected_via = Some("round1".to_string());
 
         let response = match sent {
             Sent::Answer(response) => response,
@@ -515,6 +522,7 @@ impl RagService {
                     "stale_root: the peer moved to root version {} between rounds",
                     root.version
                 );
+                state.stale = true;
                 state.fail("error", Some(error));
                 return;
             }
@@ -523,6 +531,7 @@ impl RagService {
                 return;
             }
         };
+        state.node_id = response.node_id.clone();
         let ResponseBody::Chunks {
             root_version,
             chunks,
@@ -838,6 +847,169 @@ impl RagService {
         let rescore_ms = rescore_started.elapsed().as_millis() as u64;
 
         Ok(collect(states, skipped, 0, fetch_ms, rescore_ms))
+    }
+}
+
+impl RagService {
+    /// Fetch `peer`'s directory in the background, so a later query can use
+    /// it (15.2: fallback peers, and peers found on a newer root in round 2).
+    fn spawn_directory_fetch(self: &Arc<Self>, endpoint: &iroh::Endpoint, peer: EndpointId) {
+        if !self.config.directory {
+            return;
+        }
+        let service = Arc::clone(self);
+        let endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            service.fetch_directory(&endpoint, peer).await;
+        });
+    }
+
+    /// A `PeerState` for a peer whose clusters come from the directory: its
+    /// offers are every stored cluster, at the directory's root version.
+    fn directory_state(&self, peer: EndpointId, query_started: Instant) -> Option<PeerState> {
+        let accepted = self
+            .registry()
+            .get(&peer)
+            .and_then(|e| e.root.as_ref())
+            .map(|r| r.version)?;
+        let directory = self.directory();
+        let stored = directory.get(&peer)?;
+        if stored.root_version != accepted || stored.entries.is_empty() {
+            return None;
+        }
+        let mut state = PeerState::new(peer);
+        state.root_version = stored.root_version;
+        state.new_root = self
+            .registered_root(&peer, stored.root_version, query_started)
+            .is_some_and(|(_, new)| new);
+        state.offers = stored
+            .entries
+            .iter()
+            .map(|e| Offer {
+                cluster_id: e.cluster_id,
+                subtree_root: e.subtree_root,
+                centroid: e.centroid.clone(),
+                claimed_best: None,
+            })
+            .collect();
+        state.result.root_version = Some(stored.root_version);
+        state.result.offered_clusters = stored.entries.len();
+        state.result.selected_via = Some("directory".to_string());
+        state.result.flags = stored.flags.clone();
+        Some(state)
+    }
+
+    /// The directory pipeline (`docs/merkle_tree.md`, 15.3): clusters are
+    /// chosen locally from the stored directories; only round 2 goes over the
+    /// network. Peers without a fresh entry use round 1 (`directory_fallback`)
+    /// or are reported as `no_directory`.
+    pub(super) async fn directory_mode(
+        self: &Arc<Self>,
+        query: &str,
+        link: &PeerLink,
+        query_started: Instant,
+    ) -> Result<RemoteRetrieval, BoxError> {
+        let (asked, mut skipped) = self.split_targets(link);
+        let cfg = &self.config;
+
+        // Peers with a directory entry at their accepted root version, and the rest.
+        let mut states = Vec::new();
+        let mut fallback = Vec::new();
+        for peer in &asked {
+            match self.directory_state(*peer, query_started) {
+                Some(state) => states.push(state),
+                None if cfg.directory_fallback => fallback.push(*peer),
+                None => skipped.push(PeerResult::new(*peer, "no_directory")),
+            }
+        }
+        if states.is_empty() && fallback.is_empty() {
+            return Ok(RemoteRetrieval {
+                peers: skipped,
+                ..Default::default()
+            });
+        }
+
+        // The query embedding and round 1 for fallback peers, at the same time.
+        let select_started = Instant::now();
+        for peer in &fallback {
+            self.spawn_directory_fetch(&link.endpoint, *peer);
+        }
+        let round1 = futures::future::join_all(
+            fallback
+                .iter()
+                .map(|peer| self.round1(link, *peer, query, query_started)),
+        );
+        let query_text = [query];
+        let (embedded, fallback_states) = tokio::join!(self.sidecar.embed(&query_text), round1);
+        let q = embedded?
+            .pop()
+            .ok_or("the sidecar returned no query embedding")?;
+
+        // Score locally: every stored centroid, plus fallback peers' round 1.
+        let directory_peers: Vec<EndpointId> = states.iter().map(|s| s.peer).collect();
+        let mut candidates = self.directory().candidates(&q, &directory_peers);
+        let from_directory = candidates.len();
+        states.extend(fallback_states);
+        for state in &states[directory_peers.len()..] {
+            for offer in &state.offers {
+                if offer.centroid.len() == q.len() {
+                    candidates.push(Candidate {
+                        peer: state.peer,
+                        cluster_id: offer.cluster_id,
+                        sim: dot(&q, &offer.centroid),
+                        claimed_best: offer.claimed_best,
+                    });
+                }
+            }
+        }
+        let index: HashMap<EndpointId, usize> = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.peer, i))
+            .collect();
+        for winner in select_clusters(
+            &candidates,
+            cfg.select_by,
+            cfg.max_clusters,
+            cfg.min_centroid_score,
+        ) {
+            let candidate = &candidates[winner];
+            states[index[&candidate.peer]]
+                .selected
+                .push(candidate.cluster_id);
+        }
+        let select_ms = select_started.elapsed().as_millis() as u64;
+
+        // Round 2, only with peers that won a cluster (unchanged).
+        let fetch_started = Instant::now();
+        futures::future::join_all(
+            states
+                .iter_mut()
+                .filter(|s| !s.selected.is_empty())
+                .map(|state| self.round2(link, state, query)),
+        )
+        .await;
+        let fetch_ms = fetch_started.elapsed().as_millis() as u64;
+        // A peer on a newer root: its new root is in the registry already;
+        // fetch the matching directory for the next query (15.3, step 6).
+        for state in states.iter().filter(|s| s.stale) {
+            self.spawn_directory_fetch(&link.endpoint, state.peer);
+        }
+
+        let rescore_started = Instant::now();
+        if cfg.rescore {
+            self.rescore(&mut states, &q).await?;
+        }
+        let rescore_ms = rescore_started.elapsed().as_millis() as u64;
+
+        let mut remote = collect(states, skipped, select_ms, fetch_ms, rescore_ms);
+        if cfg.select_by == SelectBy::BestChunk && from_directory > 0 {
+            // Directory entries carry no claimed best chunk score.
+            remote
+                .flags
+                .push("select_by_centroid_for_directory".to_string());
+        }
+        Ok(remote)
     }
 }
 

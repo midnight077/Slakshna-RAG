@@ -48,7 +48,8 @@ def summary(question, response):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--api", default="http://localhost:8545")
-    parser.add_argument("--retrieval", choices=["two_round", "flat"], help="override the node's [rag] retrieval")
+    parser.add_argument("--retrieval", choices=["two_round", "flat", "directory"],
+                        help="override the node's [rag] retrieval")
     parser.add_argument("--scope", default="all", choices=["all", "local", "peers"])
     parser.add_argument("--questions", default=os.path.join(ROOT, "corpus", "questions.jsonl"))
     parser.add_argument("--ids", help="comma-separated question ids, e.g. q01,q07 (default: all)")

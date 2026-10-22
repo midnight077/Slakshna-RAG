@@ -267,6 +267,13 @@ async fn rag_query(
     if request.query.trim().is_empty() {
         return rag_error(StatusCode::BAD_REQUEST, "empty_query", "query must not be empty".to_string());
     }
+    if request.retrieval == Some(crate::config::Retrieval::Directory) && !rag.config.directory {
+        return rag_error(
+            StatusCode::BAD_REQUEST,
+            "directory_disabled",
+            "retrieval \"directory\" needs [rag] directory = true on this node".to_string(),
+        );
+    }
     let link = state.network.read().await.rag_link().await;
     match rag.query(request, link).await {
         Ok(response) => Json(response).into_response(),

@@ -90,8 +90,9 @@ pub struct PeerLink {
 pub struct PeerResult {
     pub endpoint_id: String,
     /// "ok", "timeout", "error", "no_root" (its answers matched no signed
-    /// root), "skipped_stale" (not asked: down lately) or "refused" (not
-    /// asked: caught equivocating).
+    /// root), "skipped_stale" (not asked: down lately), "refused" (not
+    /// asked: caught equivocating) or "no_directory" (directory mode without
+    /// fallback: no fresh directory entry).
     pub status: String,
     /// Chunks kept from this peer.
     pub chunks: usize,
@@ -107,6 +108,8 @@ pub struct PeerResult {
     pub flags: Vec<String>,
     pub round1_ms: Option<u64>,
     pub round2_ms: Option<u64>,
+    /// How this peer's clusters were chosen: "directory" or "round1".
+    pub selected_via: Option<String>,
     /// JSON bytes sent to and received from this peer during this query, over
     /// every request (round 1, round 2, a search, or an inline `hello`).
     pub bytes_sent: u64,
@@ -151,6 +154,7 @@ impl PeerResult {
             flags: Vec::new(),
             round1_ms: None,
             round2_ms: None,
+            selected_via: None,
             bytes_sent: 0,
             bytes_received: 0,
             error: None,
@@ -180,6 +184,9 @@ pub struct QueryResponse {
     pub contexts: Vec<Chunk>,
     pub peers: Vec<PeerResult>,
     pub timings_ms: Timings,
+    /// Notes about the whole query (e.g. "select_by_centroid_for_directory").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
 }
 
 /// Pool chunks from several nodes into one ranked list of at most `final_k`.
@@ -381,7 +388,7 @@ impl RagService {
     ///
     /// `link` is the way to other nodes; without it only the local index is used.
     pub async fn query(
-        &self,
+        self: &Arc<Self>,
         request: QueryRequest,
         link: Option<PeerLink>,
     ) -> Result<QueryResponse, BoxError> {
@@ -407,6 +414,7 @@ impl RagService {
                 Some(link) => match mode {
                     Retrieval::TwoRound => self.two_round(&request.query, link, started).await,
                     Retrieval::Flat => self.flat(&request.query, top_k, link, started).await,
+                    Retrieval::Directory => self.directory_mode(&request.query, link, started).await,
                 },
                 None => Ok(retrieval::RemoteRetrieval::default()),
             }
@@ -431,6 +439,7 @@ impl RagService {
         let generate = generate_started.elapsed().as_millis() as u64;
 
         Ok(QueryResponse {
+            flags: remote.flags.clone(),
             retrieval: mode,
             answer,
             contexts,
@@ -502,6 +511,52 @@ mod tests {
         );
         let ids: Vec<_> = merged.iter().map(|c| c.chunk_id.as_str()).collect();
         assert_eq!(ids, vec!["n2#0", "x"]);
+    }
+
+    #[test]
+    fn a_query_can_ask_for_directory_mode() {
+        let request: QueryRequest = serde_json::from_str(r#"{"query": "q", "retrieval": "directory"}"#).unwrap();
+        assert_eq!(request.retrieval, Some(Retrieval::Directory));
+    }
+
+    /// Write `toml` to a temporary file and load it as a node config.
+    fn load_config(name: &str, toml: &str) -> Result<crate::config::Config, BoxError> {
+        let path = std::env::temp_dir().join(format!("slakshna-test-{}-{}.toml", std::process::id(), name));
+        std::fs::write(&path, toml).unwrap();
+        let loaded = crate::config::Config::load(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        loaded
+    }
+
+    #[test]
+    fn example_configs_load_and_directory_mode_needs_the_switch() {
+        let example = include_str!("../../examples/rag-2node/node1.toml");
+        let config = load_config("example", example).unwrap();
+        assert!(config.rag.directory);
+        assert!(config.rag.directory_fallback);
+        assert_eq!(config.rag.retrieval, Retrieval::TwoRound);
+
+        // Every config in examples/ still loads (cargo runs tests from the crate root).
+        for dir in std::fs::read_dir("examples").unwrap() {
+            for file in std::fs::read_dir(dir.unwrap().path()).unwrap() {
+                let path = file.unwrap().path();
+                if path.extension().is_some_and(|e| e == "toml") {
+                    crate::config::Config::load(path.to_str().unwrap())
+                        .unwrap_or_else(|e| panic!("{} no longer loads: {}", path.display(), e));
+                }
+            }
+        }
+
+        // A config from before M8 (no directory settings) still loads, switched off.
+        let older = load_config("older", &example.replace("directory = true", "")).unwrap();
+        assert!(!older.rag.directory);
+
+        let with_mode = example.replace("directory = true", "directory = true\nretrieval = \"directory\"");
+        assert_eq!(load_config("mode", &with_mode).unwrap().rag.retrieval, Retrieval::Directory);
+
+        let without_switch = example.replace("directory = true", "retrieval = \"directory\"");
+        let error = load_config("no-switch", &without_switch).unwrap_err().to_string();
+        assert!(error.contains("rag.directory = true"), "{}", error);
     }
 
     #[test]
