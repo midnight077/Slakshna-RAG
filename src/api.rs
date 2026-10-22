@@ -308,6 +308,7 @@ async fn rag_status(AxumState(state): AxumState<SharedState>) -> impl IntoRespon
             "own_root": rag.own_root().await,
             "retrieval": rag.config.retrieval,
             "registry": rag.registry_status(&target_ids),
+            "directory": rag.directory_status(),
             "top_k": rag.config.top_k,
             "final_k": rag.config.final_k
         })).into_response(),

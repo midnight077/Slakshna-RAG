@@ -5,6 +5,7 @@
 //! that — the sidecar client and the query pipeline behind `POST /rag/query`.
 
 pub mod adversary;
+pub mod directory;
 pub mod merkle;
 pub mod protocol;
 pub mod registry;
@@ -13,6 +14,7 @@ pub mod sidecar;
 
 use crate::config::{ RagConfig, Retrieval };
 use crate::history::BoxError;
+use directory::{ CentroidDirectory, DirectoryStatus };
 use merkle::{ Commitment, SignedRoot };
 use protocol::{ RagRequest, RequestBody, ResponseBody };
 use registry::{ PeerRootStatus, RootOutcome, RootRegistry };
@@ -212,6 +214,8 @@ pub struct RagService {
     registry: Mutex<RootRegistry>,
     /// `hello` answers given, used only by `[rag] adversary = "equivocate"`.
     hellos_served: AtomicU64,
+    /// Verified copies of peers' centroids (directory mode).
+    directory: Mutex<CentroidDirectory>,
 }
 
 impl RagService {
@@ -224,7 +228,18 @@ impl RagService {
             own_root: RwLock::new(None),
             registry: Mutex::new(RootRegistry::default()),
             hellos_served: AtomicU64::new(0),
+            directory: Mutex::new(CentroidDirectory::default()),
         }
+    }
+
+    /// The centroid directory. Never hold the guard across an `.await`.
+    fn directory(&self) -> MutexGuard<'_, CentroidDirectory> {
+        self.directory.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The directory's view of every peer, for `GET /rag/status`.
+    pub fn directory_status(&self) -> DirectoryStatus {
+        self.directory().status(self.config.directory, Instant::now())
     }
 
     /// The root registry. Never hold the guard across an `.await`.
@@ -446,6 +461,10 @@ pub async fn run_root_refresh(
             let results = service.refresh_peer_roots(&link).await;
             let ok = results.iter().filter(|r| r.status == "ok").count();
             tracing::debug!("Refreshed RAG roots: {} of {} peers answered", ok, results.len());
+            // Directory mode: fetch the centroids of peers whose root changed.
+            if service.config.directory {
+                service.refresh_directories(&link).await;
+            }
         }
         tokio::time::sleep(Duration::from_secs(service.config.root_refresh_secs)).await;
     }
