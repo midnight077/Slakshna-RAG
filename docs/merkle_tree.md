@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M7 done (M7 on 2026-10-22). M8 (centroid directory, a third retrieval mode, section 15) and M9 (evaluation of all three modes on the HPC with the user's dataset, section 16) not started.** M8 and M9 are developed on branch `centroid-directory`. Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M8 done (M8, the centroid directory mode, on 2026-10-22, branch `centroid-directory`). M9 (evaluation of all three modes on the HPC with the user's dataset, section 16) not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -501,7 +501,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M5 — root registry and stale-peer skipping (done 2026-10-18; see section 14)
 - [x] Phase M6 — two-round query and flat mode (done 2026-10-19, on one machine and across both; see section 14)
 - [x] Phase M7 — simulated adversaries (done 2026-10-22; see section 14)
-- [ ] Phase M8 — centroid directory mode (section 15)
+- [x] Phase M8 — centroid directory mode (done 2026-10-22; design in section 15, results in section 14)
 - [ ] Phase M9 — evaluation of all three modes on the HPC (section 16)
 
 ## 14. Results
@@ -732,6 +732,90 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J32–J
 - `equivocate` signs the real root with its first byte flipped, under the same version. "Every other `hello`" counts all `hello`s this node answers, from any peer.
 - The `/rag/status` fix described above.
 - The live check ran in an isolated test federation with fresh data rather than with the `examples/rag-2node` configs.
+
+### Phase M8 (2026-10-22, machine 1) — centroid directory mode
+
+Done, in the steps of 15.6 (one commit each):
+- **M8a:** `VectorStore.all_clusters()` and `GET /clusters`. 2 new Python tests.
+- **M8b:** `expected_sides` and `ClusterEntry::verify_at` in `src/rag/merkle.rs`, plus a test-only Rust proof builder (`merkle::testing`). Round 1 and flat mode now use `verify_at`.
+- **M8c:**
+  - the `directory` request kind (served only with `[rag] directory = true`) and the sidecar client `clusters()`;
+  - byte counters in `request_peer` (`bytes_sent` / `bytes_received` on `PeerResult` and `PeerHello`);
+  - config `directory` (default false) and `directory_fallback` (default true);
+  - adversary `hide_cluster`, and `fake_centroid` on directory answers.
+- **M8d:** `src/rag/directory.rs` (new): `CentroidDirectory` with `update` / `candidates` / `status`, fetches after each background `hello` round (`refresh_directories`), and `directory` in `/rag/status`. The scale test is `#[ignore]`.
+- **M8e:** the `directory` pipeline (`directory_mode` in `src/rag/retrieval.rs`):
+  - fallback to round 1 with a background directory fetch, or `no_directory` when fallback is off;
+  - `selected_via`, and the query-level `flags`;
+  - `retrieval = "directory"` in the config, with the check that it needs `directory = true`;
+  - HTTP 400 `directory_disabled` per query;
+  - `--retrieval directory` in `scripts/rag_run_questions.py`, and `directory = true` in `examples/rag-2node/node*.toml` (default mode still `two_round`).
+
+Check (15.6):
+
+**1. Unit tests and formatting.**
+- Python: 51 tests pass.
+- `cargo test --release`: 50 pass, plus the ignored scale test. The new tests include:
+  - every fixture proof has the expected shape;
+  - honest proofs pass `verify_at` for 1–40 clusters;
+  - for every `n` from 1 to 40, an honest tree with `n + 1` clusters fails as `n`;
+  - the directory's completeness and proof checks;
+  - the `directory` JSON shape;
+  - every `examples/*/*.toml` (14 files) still loads, and `retrieval = "directory"` without `directory = true` is refused.
+- `rustfmt --check` on the five new files is clean. The build has no new warnings.
+
+**2. Scale test** (`cargo test --release directory_scale -- --ignored --nocapture`), 1000 peers × 13 random unit centroids, dim 384:
+- checking every entry (proof and position): 235 ms and 423 ms in two runs (18–33 µs per entry);
+- scoring and selection per query, over 100 queries: **median 4.65 ms and 7.78 ms, p95 4.84 ms and 7.88 ms** in the two runs (the plan expected under 10 ms). The machine's load differed between the runs;
+- held in memory: ~20.4 MB;
+- one directory answer: ~46 KB of JSON (13 clusters), well under `max_message_bytes`.
+
+**3. Live run.** Node 1 (Ollama), node 2, and a temporary node 3 indexing `corpus/node1`, from the `examples/rag-2node` configs, run in an isolated test federation (J36): own federation id, fresh scratch data, own ports, `peers = []`.
+- **(a)** All 15 questions in all three modes. `node1_only` 6/6 and `node2_only` 6/6 in **each** mode, `cross_node` 0/3, as in M6. Every remote context is `verified` (two_round 50, flat 53, directory 50) and no peer flags were raised, so `verify_at` changed nothing for honest peers. Answers were the same in all three modes, apart from wording ("Rameswaram, Tamil Nadu" in directory mode; q14 is wrong in a different way in two_round).
+- **(b)** In directory mode after the first refresh, every live peer had `selected_via = "directory"` and `round1_ms = null`, and round 2 went exactly to the peers with `selected_clusters`.
+- **(c)** The selected clusters agree between directory and two_round on 4 of 15 questions. To check every difference, both selections were predicted from the nodes' real centroids. Node 2's centroids were taken from a rebuild of its index before the re-ingest in (f), which gave the same root, `5172ade3…`. The rule: two_round takes the global top 5 of each peer's top 3; directory takes the global top 5 of all clusters, ≥ 0.2, always keeping the best.
+  - Actual equals predicted on 15/15 questions in **both** modes.
+  - Every one of the 11 differences is a peer's 4th- or 5th-ranked cluster entering the global top 5 (e.g. q07: node 2's clusters 11 and 7, ranks 4 and 5, similarities 0.44 and 0.30), which two_round can't see.
+  - The agreement is low because each corpus spreads one subject over many similar clusters, so a peer's 4th and 5th clusters often outrank the other peer's best.
+- **(d)** Medians per query:
+
+  | Mode | `select` | `peer_retrieve` | bytes per query (sent + received) |
+  | :-- | --: | --: | --: |
+  | two_round | 34 ms | 385 ms | 66.3 KB (range 48–69) |
+  | flat | 0 ms | 237 ms | 32.2 KB (28–41) |
+  | directory | 16 ms | 346 ms | 44.1 KB (38–45) |
+
+  Directory `select` is mostly the query embedding; the local scoring of 26 centroids is negligible. Directory mode saves round 1 (about 22 KB per query here), but round 2 still carries up to 15 chunks with proofs. So it sits between two_round and flat on bytes. That difference grows with the number of peers, which M9 measures.
+- **(e) Startup.** The first run's startup query reached no peers at all: fresh data folders, so node 1 knew no peers yet. This was redone with the same data restarted, so node 1 remembered nodes 2 and 3 but had no directory yet. The first query used `selected_via = "round1"` for both (round 1 ≈ 310 ms); the query after the refresh used `"directory"` for both, with no round 1.
+- **(f) Re-ingest.** One document was ingested on node 2 (`/rag/ingest`, new version 1792665064261).
+  - The next directory-mode query from node 1 (before its refresh) chose node 2's clusters from the old directory. Round 2 got `stale_root`, node 2 was reported `error: "stale_root: the peer moved to root version 1792665064261 between rounds"`, the new root went into the registry, and a directory fetch was spawned. That query answered from local chunks only ("Allahabad", wrong).
+  - 3 s later, `/rag/status` showed node 2's directory at the new version (13/13 clusters, complete). The next query used it (`selected_via = "directory"`, `root_version` new, 15 chunks) and answered "Rameswaram" with the new document as its first context.
+- **Mixed set-up** (not in the plan): node 3 was restarted with `directory = false`. Node 1's directory then held only node 2. In directory mode node 2 came `via=directory` and node 3 `via=round1` (fallback) on every query, and a `"retrieval": "directory"` query to node 3 itself got HTTP 400 `directory_disabled`.
+
+**4. Attacks in directory mode** (isolated test federation, node 1 honest, node 2 attacking; 6 `node2_only` questions per mode, both nodes restarted per mode):
+
+| Attack | Node 1's directory of node 2 | Result in directory mode | `FORGED` in contexts or answer |
+| :-- | :-- | :-- | :-- |
+| `fake_centroid` | 0 of 13 kept, `bad_centroid_proof` | fell back to round 1, `bad_centroid_proof` there too; no cluster selected; no round 2 | never |
+| `hide_cluster` | 12 of 13 kept, `incomplete_directory`, not complete | the 12 remaining clusters used via the directory; chunks verified; cluster 12 never selected | never |
+| `tamper_text` | complete | `bad_chunk_proof`; every round-2 chunk rejected (12–15 per question) | never |
+| `inflate_score` | complete | `score_mismatch`; every claimed score 0.300 above the recomputed one; own scores used | never |
+| `equivocate` | complete | first q07 normal (13 verified chunks); after the second `hello`, `equivocation` with 2 roots in `evidence`, node 2 `refused`, `asked_in_queries: false` | never |
+
+- All attacks were detected as 15.4 and M7 predict.
+- `score_overclaim` is not raised in directory mode, as in flat mode, because directory entries carry no claimed best chunk score to check.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, K12–K20):
+- `request_peer` adds to a byte counter the caller owns, instead of returning counts. That way failed and timed-out requests are counted too. The counts are JSON payload bytes, not QUIC or TLS overhead.
+- `fake_centroid` on a `directory` answer has no query to copy, so it sends the normalised mean of the node's own centroids.
+- A failed directory fetch doesn't mark the peer as failing in the registry.
+- A peer whose stored directory has no verified entries counts as having no directory (fallback).
+- Directory flags are copied into that peer's `PeerResult.flags` in directory mode.
+- `QueryResponse` has a query-level `flags` list (for `select_by_centroid_for_directory`).
+- `query()` takes `self: &Arc<Self>`, so it can spawn background fetches.
+- `/rag/status` → `directory.peers[]` also shows `signed_clusters`.
+- The live check ran in an isolated test federation with fresh data and no pinned machine-2 peer, rather than with `examples/rag-2node` as is.
+- A test loads every example config.
 
 ## 15. Phase M8 — Centroid directory mode (design)
 

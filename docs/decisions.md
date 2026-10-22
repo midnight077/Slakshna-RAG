@@ -331,7 +331,7 @@ The nodes get their own federation id, ports and scratch data folders, and both 
 *Why:* centroids only change on ingest, so fetching per root version is enough. The registry already tracks root versions, which keeps the change small. Gossip announcements are left for later, if refresh traffic matters in M9.
 
 **K6. The directory is scored by brute force, not an ANN index (Claude, 2026-10-22).**
-*Why:* 1000 peers × 13 clusters is about 13,000 vectors, a few milliseconds per query. M8 measures this with a scale test; an index is only worth adding if that number is too high.
+*Why:* 1000 peers × 13 clusters is about 13,000 vectors, a few milliseconds per query. M8 measures this with a scale test; an index is only worth adding if that number is too high. Measured in M8: median 4.65–7.78 ms per query over two runs, under the 10 ms target.
 
 **K7. Peers without a fresh directory entry fall back to round 1 for that query (`directory_fallback = true`) (Claude, 2026-10-22).**
 *Why:* new peers, peers that just re-ingested and peers on older builds still contribute. The response says which peers came from the directory and which from round 1 (`selected_via`).
@@ -348,3 +348,34 @@ The proof's left/right pattern must match `(cluster_id, num_clusters)`.
 
 **K11. M9 includes an offline routing simulation for 1000 nodes; live runs stop at the node count the HPC allows (Claude, 2026-10-22).**
 *Why:* starting 1000 real nodes is impractical. Whether routing by centroids still finds the right chunks depends only on the vectors, so it can be measured without networking. Claims about 1000 nodes are labelled as simulated.
+
+**K12. Bytes are counted into a counter the caller owns (Claude, 2026-10-22).**
+`request_peer` adds the JSON request and response sizes to a `ByteCount` passed in by the caller, as they are written and read. The counts are JSON payload only, not QUIC or TLS overhead.
+*Why:* a returned count is lost when a request fails or a timeout cancels it halfway, and those requests also cost bytes. Payload bytes are what the modes differ in; transport overhead is about the same for all of them.
+
+**K13. `fake_centroid` sends the mean direction of the node's own centroids in `directory` answers (Claude, 2026-10-22).**
+*Why:* a `directory` request carries no query, so there is nothing to copy as in round 1. The normalised sum of all its centroids is the closest equivalent of "always win": a vector near every topic the node holds. Like any changed centroid, it fails the proof.
+
+**K14. A failed directory fetch doesn't mark the peer as failing (Claude, 2026-10-22).**
+*Why:* a peer with `directory = false`, or on an older build, answers `directory` with an error but is up. Under J23 a recorded failure would make queries skip it entirely, instead of asking it through round 1 (K7).
+
+**K15. A stored directory with no verified entries counts as "no directory" (Claude, 2026-10-22).**
+Such a peer falls back to round 1, and a directory fetch is spawned on each such query.
+*Why:* plan 15.4 expects a `fake_centroid` peer to fall back to round 1 and fail there too. An empty directory can't offer any cluster, so treating it as present would silently drop the peer.
+
+**K16. In directory mode, a peer's directory flags appear in its `PeerResult.flags` (Claude, 2026-10-22).**
+*Why:* the flags describe the data this query used (e.g. `incomplete_directory`), so they should be visible in the query's output, not only in `/rag/status`.
+
+**K17. `QueryResponse.flags` holds notes about the whole query (Claude, 2026-10-22).**
+The first is `select_by_centroid_for_directory`, set when `select_by = "best_chunk"` met directory entries, which have no claim to rank by. The field is omitted when empty.
+*Why:* plan 15.3 asks for this note "in the response's flags", and it belongs to no single peer.
+
+**K18. `RagService::query` takes `self: &Arc<Self>` (Claude, 2026-10-22).**
+*Why:* background directory fetches (fallback peers, a stale root in round 2) outlive the query, so they need their own handle on the service. The API already holds the service in an `Arc`, so callers are unchanged.
+
+**K19. The M8 live check used an isolated test federation with fresh data and no pinned peer (Claude, 2026-10-22).**
+The three nodes kept the `examples/rag-2node` settings and corpora, but got their own federation id, ports and scratch data folders, and `peers = []`.
+*Why:* the re-ingest step (f) adds a document to node 2's index, which would have changed the real `data-rag-node2` permanently. The machine-2 peer pinned in `node1.toml` runs an older build that answers `directory` with an error, which would have muddied "every peer via directory". Same practice as J36.
+
+**K20. A test loads every config under `examples/` (Claude, 2026-10-22).**
+*Why:* "existing configs still load" should be checked by a test that keeps running, not by hand once. It covers the 14 example configs, including the training-cluster ones.
