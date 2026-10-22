@@ -275,8 +275,8 @@ Each phase ends with something runnable. Do not start a phase until the previous
 - [x] Phase 2 — single-node `/rag/query` (done 2026-10-12; see section 12)
 - [x] Phase 3 — two nodes, one machine (done 2026-10-12; see section 13)
 - [x] Phase 4 — two machines, over the VPN with a pinned address (done 2026-10-12; see section 14). Not tested: node 2 asking node 1, and the relay path.
-- [ ] Phase 5 — 4/6/8 nodes
-- [ ] Phase 6 — evaluation
+- [ ] Phase 5 — 4/6/8 nodes (to be done as part of Phase M9 in `merkle_tree.md`, section 16)
+- [ ] Phase 6 — evaluation (to be done as Phase M9 in `merkle_tree.md`, section 16)
 
 ## 11. Phase 1 results (2026-10-12, machine 1)
 

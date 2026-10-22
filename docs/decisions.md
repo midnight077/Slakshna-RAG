@@ -311,3 +311,40 @@ It replaces the middle word.
 **J36. Live attack tests use an isolated test federation with fresh data (Claude, 2026-10-22).**
 The nodes get their own federation id, ports and scratch data folders, and both are restarted for each mode.
 *Why:* a misbehaving node must not join, or be remembered by, the real nodes and their RocksDB peer lists. Restarting the honest node between modes clears its in-memory flags, so each mode is judged on its own. The same set-up was used to check the HNSW switch end to end (C10), because a real node was running at the time.
+
+## K. Centroid directory (third retrieval mode) and the HPC evaluation
+
+**K1. The centroid directory is a third retrieval mode in the same code, developed on branch `centroid-directory` (User, 2026-10-22).**
+`retrieval = "directory"` sits next to `flat` and `two_round`, rather than living in a fork of the repository.
+*Why:* the new mode reuses almost everything: signed roots, proofs, the registry, round 2, checks, rescoring and merging. A fork would need every fix made twice. With one build, a query can pick any mode, so all three are compared on exactly the same nodes and data.
+
+**K2. Phase M8 is the directory mode; evaluation of all three modes moves to M9, run on the user's HPC with the user's dataset (User, 2026-10-22).**
+*Why:* the evaluation should cover the new mode too, and the 2-node test corpus is too small for results. The HPC provides scale; the dataset provides questions worth reporting.
+
+**K3. The directory is fetched with a new request kind, `directory`, without changing the ALPN (Claude, 2026-10-22).**
+*Why:* adding a kind doesn't change any existing message. A node on an older v2 build answers it with an error. The asker then treats that peer as having no directory and falls back to round 1 for it (K7), so mixed builds still work.
+
+**K4. Directory mode reveals a node's full set of centroids to any allowed peer, and is off unless `[rag] directory = true` (Claude, 2026-10-22).** Reverses D1 for nodes that turn it on.
+*Why:* at large scale, `two_round` sends every question to every peer. The directory trades that for revealing topic summaries, and then only the round-2 peers see a question. The privacy cost differs, so each deployment chooses.
+
+**K5. Directories are pulled when a peer's root version changes, as part of the background root refresh (Claude, 2026-10-22).**
+*Why:* centroids only change on ingest, so fetching per root version is enough. The registry already tracks root versions, which keeps the change small. Gossip announcements are left for later, if refresh traffic matters in M9.
+
+**K6. The directory is scored by brute force, not an ANN index (Claude, 2026-10-22).**
+*Why:* 1000 peers × 13 clusters is about 13,000 vectors, a few milliseconds per query. M8 measures this with a scale test; an index is only worth adding if that number is too high.
+
+**K7. Peers without a fresh directory entry fall back to round 1 for that query (`directory_fallback = true`) (Claude, 2026-10-22).**
+*Why:* new peers, peers that just re-ingested and peers on older builds still contribute. The response says which peers came from the directory and which from round 1 (`selected_via`).
+
+**K8. Cluster entries are checked position-bound in every mode, and a directory must hold exactly the signed number of clusters (Claude, 2026-10-22).**
+The proof's left/right pattern must match `(cluster_id, num_clusters)`.
+*Why:* this makes hiding a whole cluster from the directory detectable (`incomplete_directory`). An honest proof always has this shape, so applying the check in all modes costs nothing and keeps one verification path. M8 confirms by test that a tree with more leaves than signed can't pass.
+
+**K9. Each peer's request and response bytes are counted in every mode (Claude, 2026-10-22).**
+*Why:* bytes per query is a main metric in M9, and it should be measured, not estimated.
+
+**K10. New simulated attack `hide_cluster`; `fake_centroid` also covers `directory` answers (Claude, 2026-10-22).**
+*Why:* `hide_cluster` is the attack K8 is meant to catch. Extending `fake_centroid` follows J34, since attackers lie consistently.
+
+**K11. M9 includes an offline routing simulation for 1000 nodes; live runs stop at the node count the HPC allows (Claude, 2026-10-22).**
+*Why:* starting 1000 real nodes is impractical. Whether routing by centroids still finds the right chunks depends only on the vectors, so it can be measured without networking. Claims about 1000 nodes are labelled as simulated.

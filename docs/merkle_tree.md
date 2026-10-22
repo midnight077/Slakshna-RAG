@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M7 done (M7 on 2026-10-22); M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M7 done (M7 on 2026-10-22). M8 (centroid directory, a third retrieval mode, section 15) and M9 (evaluation of all three modes on the HPC with the user's dataset, section 16) not started.** M8 and M9 are developed on branch `centroid-directory`. Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -30,7 +30,9 @@ What this gives you:
 
 What it does **not** give you is listed in section 11. Read that section before making claims in a paper.
 
-## 1. Decisions (approved by the user, 2026-10-18)
+**Third mode, `directory` (Phase M8, section 15).** Round 1 asks *every* peer, which doesn't scale to hundreds or thousands of nodes. In directory mode each node keeps a local copy of every peer's centroids, each checked against that peer's signed root. The copy is fetched once per root version, not once per query. Choosing clusters then happens locally, with no network traffic, and only round 2 goes over the network. All three modes (`flat`, `two_round`, `directory`) live in one build, and a query picks one, so they can be compared on identical data (Phase M9, section 16).
+
+## 1. Decisions (D1–D10 approved by the user, 2026-10-18; D11–D16 on 2026-10-22)
 
 | # | Decision | Reason |
 | :-- | :-- | :-- |
@@ -44,6 +46,12 @@ What it does **not** give you is listed in section 11. Read that section before 
 | D8 | The signing key is the node's **Iroh transport key** (`SecretKey::from_bytes(&keypair.transport_seed())`), not the federation keypair. | The asker already knows each peer's EndpointId, and the EndpointId is that public key. QUIC has already proved the connection comes from it. So the signature can be checked with nothing extra, and it gives evidence a third party can check too. |
 | D9 | Roots carry a version number that only goes up; a proof names the version it belongs to. | Re-ingesting changes the root. |
 | D10 | Stale peers are skipped, using the root registry's last-seen times. Round 1 has its own, shorter timeout. | A down peer currently costs 5 s per query, and with two rounds that delay would come before round 2 can start. |
+| D11 | **Centroid directory** is a third retrieval mode (`retrieval = "directory"`), not a separate fork of the code. It is developed on branch `centroid-directory`. (User) | It reuses the roots, proofs, registry, round 2, checks, rescoring and merging. All three modes can be compared in one build, on the same data. |
+| D12 | Directory mode reverses D1 **for nodes that enable it**: any allowed peer can fetch a node's full set of centroids. It is off unless `[rag] directory = true`. | At large scale, sending every query to every peer reveals every question to everyone. The directory reveals topic maps instead, and only round-2 peers see the question. Each deployment chooses. |
+| D13 | Directories are **pulled** (new request kind `directory`), only when a peer's accepted root version changes, piggybacking on the registry's background refresh. | Centroids only change when a node ingests documents. Gossip push is a later option (section 12). |
+| D14 | Directory entries are checked **position-bound**: the proof's shape must match `(cluster_id, num_clusters)`, and a directory must contain exactly the signed `num_clusters` entries, ids `0..k-1`. | This turns "a peer can hide a whole cluster" (section 11) into a detectable `incomplete_directory`, for the cluster level. |
+| D15 | Peers without a fresh directory entry fall back to round 1 for that query (`directory_fallback = true`). | New peers, peers that just re-ingested, and peers on older builds still take part, and nothing is silently lost. |
+| D16 | Evaluation of all three modes (old M8) becomes **M9**, run on the user's HPC with the user's dataset. (User) | The 2-node test corpus is too small for claims. Scale needs real hardware and a real dataset. |
 
 ## 2. Cryptographic format (exact bytes; Python and Rust must match)
 
@@ -367,6 +375,11 @@ require_prior_root = false  # true: drop chunks under a root first seen during t
 root_refresh_secs = 60
 peer_stale_secs = 180
 adversary = "none"          # EXPERIMENTS ONLY, see section 9
+
+# Added in Phase M8 (section 15)
+# retrieval also accepts "directory"
+directory = false           # keep a verified copy of every peer's centroids (needed for retrieval = "directory")
+directory_fallback = true   # directory mode: peers without a fresh directory entry get round 1
 ```
 
 Validation in `config.rs`:
@@ -415,16 +428,11 @@ Each phase ends with a check. Don't start a phase until the previous check passe
 - The `adversary` modes (section 9).
 - **Check:** each attack is detected as the table predicts, with the expected flag in `peers[].flags`, and the answer contains no tampered text.
 
-### Phase M8 — Evaluation (feeds Phase 6 of `p2p_rag_plan.md`)
-- Compare `flat` with `two_round` at 2, 4, 6 and 8 nodes:
-  - retrieval recall@k against the single-index baseline;
-  - answer accuracy;
-  - peers contacted in round 2 per query;
-  - bytes sent per query (round 1 + round 2);
-  - latency split into select, fetch and rescore;
-  - extra cost of verification and rescoring;
-  - detection rate per adversary.
-- Sweep `n_clusters`, `max_clusters`, `min_centroid_score` and `select_by`.
+### Phase M8 — Centroid directory mode
+- Full design, steps and check in **section 15**.
+
+### Phase M9 — Evaluation of all three modes on the HPC (feeds Phases 5–6 of `p2p_rag_plan.md`)
+- Full plan in **section 16**. It replaces the old M8 ("evaluation"), adds `directory` as a third mode, and runs on the user's dataset and HPC.
 
 ## 9. Simulated adversaries (`[rag] adversary`, experiments only)
 
@@ -436,6 +444,9 @@ These run in the **responder's** Rust code after its sidecar answers, so Python 
 | `inflate_score` | adds 0.3 to every chunk `score` and `best_chunk_score` | `score_mismatch`; recomputed scores used; `score_overclaim` |
 | `fake_centroid` | replaces each centroid with the query embedding (via its own `/embed`) to always win selection | `bad_centroid_proof`; centroid dropped, so the peer is not selected |
 | `equivocate` | signs a different root under the same version on every other `hello` | `equivocation`; both signed roots in `evidence`; peer's chunks refused |
+| `hide_cluster` (M8) | leaves its highest-numbered cluster out of every `directory` answer | `incomplete_directory`; the other entries are still used |
+
+In M8, `fake_centroid` also corrupts `directory` answers, following J34.
 
 ## 10. Files touched
 
@@ -464,7 +475,8 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 ## 11. What this does not protect against (say so in any write-up)
 
 - **Poison committed in advance.** A peer can ingest harmful documents before it publishes its root. The proofs then pass. This scheme makes peers *commit*; it doesn't make their content *true*. Trust scores are still needed.
-- **Hiding chunks.** A Merkle proof shows that a chunk *is in* the corpus, not that it is the *best* chunk. A peer can leave out relevant chunks or hide a whole cluster in round 1. That can't be detected without revealing much more of the corpus.
+- **Hiding chunks.** A Merkle proof shows that a chunk *is in* the corpus, not that it is the *best* chunk. A peer can leave out relevant chunks or hide a whole cluster in round 1. That can't be detected without revealing much more of the corpus. In directory mode (D14) hiding a *cluster* is detected, but hiding *chunks* within a cluster still is not. `size` in a cluster entry is not committed, so chunk-level completeness would need it in the cluster hash (section 12).
+- **Directory mode reveals topic maps (D12).** Any allowed peer can fetch every centroid of a node with `directory = true`. That is a summary of everything the node holds. Use `allowed_peers` if this matters.
 - **First contact (trust on first use).** The first root the asker sees from a peer is accepted as is. Pins live in memory only, so after a restart the asker trusts again on first use. Persisting pins in RocksDB is a later step.
 - **Root rebuilt per query.** A peer could build and sign a new root for every query. That shows up as `verified_new_root` and a version that keeps climbing. Only `require_prior_root = true` blocks it, at the cost of ignoring peers that just re-ingested.
 - **Privacy.** Round 1 still sends the raw query to every live peer. Centroids reveal a peer's topics. Chunks are raw text. This is unchanged from v1.
@@ -477,6 +489,8 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - Feed `flags` into the trust scores in `src/history.rs`.
 - Share of `final_k` per node or per cluster, to target the cross-node failures.
 - Send the query embedding in round 1 instead of the text.
+- Directory mode: announce new root versions over gossip instead of polling every peer each minute. Use an ANN index (HNSW) over the directory if M9 shows brute-force scoring matters (it shouldn't below ~10⁵ centroids). Commit `size` in the cluster hash for chunk-level completeness. A fully distributed index (each node owns a region of embedding space) only beyond ~10⁵ nodes.
+- Membership at scale: a node only queries peers it knows (gossip neighbours plus remembered peers). Beyond a few dozen nodes a real membership mechanism is needed; M9 works around it by listing every peer in the config.
 
 ## 13. Status checklist
 
@@ -487,7 +501,8 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M5 — root registry and stale-peer skipping (done 2026-10-18; see section 14)
 - [x] Phase M6 — two-round query and flat mode (done 2026-10-19, on one machine and across both; see section 14)
 - [x] Phase M7 — simulated adversaries (done 2026-10-22; see section 14)
-- [ ] Phase M8 — evaluation
+- [ ] Phase M8 — centroid directory mode (section 15)
+- [ ] Phase M9 — evaluation of all three modes on the HPC (section 16)
 
 ## 14. Results
 
@@ -717,3 +732,286 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J32–J
 - `equivocate` signs the real root with its first byte flipped, under the same version. "Every other `hello`" counts all `hello`s this node answers, from any peer.
 - The `/rag/status` fix described above.
 - The live check ran in an isolated test federation with fresh data rather than with the `examples/rag-2node` configs.
+
+## 15. Phase M8 — Centroid directory mode (design)
+
+Planned 2026-10-22. Decisions D11–D15 (section 1) and K1–K9 in `docs/decisions.md`.
+
+### 15.1 Idea in plain language
+
+In `two_round` mode, round 1 sends the question to every peer just to learn which clusters exist and how close they are to the question. With 1000 peers that means:
+- 1000 connections per question;
+- about 10 MB of centroids coming back;
+- waiting for the slowest of 1000 peers;
+- all 1000 peers seeing every question.
+
+But a peer's centroids only change when it ingests documents. So each node can keep a **directory**: a local, verified copy of every peer's centroids, mapping each centroid to its owner and cluster:
+
+```
+centroid vector → (peer, cluster_id, subtree_root, root_version)
+```
+
+A query in `directory` mode then runs like this:
+
+```
+asker: embed the query, score it against every centroid in the directory  (local, a few ms)
+asker: pick the best ≤ max_clusters clusters (same selection as two_round)
+Round 2  asker → only the owners of those clusters (unchanged)
+asker: check proofs, rescore, merge, answer (unchanged)
+```
+
+Size estimate at 1000 peers with about 13 clusters each:
+- 13,000 centroids × 1.5 KB ≈ **20 MB** in memory;
+- scoring one query against all of them is about 5 million multiply-adds, a few milliseconds;
+- no ANN index is needed at this size (D13 / section 12).
+
+### 15.2 Fetching and checking a directory
+
+**New request kind** (no ALPN change; see K3):
+
+```json
+{"v":2, "kind":"directory", "query_id":"…"}
+→ {"v":2, "kind":"directory", "query_id":"…", "node_id":"…", "embedding_model":"…",
+   "root_version": …, "clusters": [ClusterEntry, …], "error": null}
+```
+
+`clusters` lists every cluster of the peer's current commitment, in the 3.3 shape, without `best_chunk_score`.
+
+Size:
+- about 3.5 KB per entry, so about 45 KB for 13 clusters and about 225 KB for the maximum of 64, under `max_message_bytes` (1 MiB);
+- with a larger embedding model (M9 may use one), it is about `dim × 8` bytes of hex per entry, so check against `max_message_bytes`.
+
+**Sidecar:** new `GET /clusters` returns `{root_version, clusters}`, built from `store.all_clusters()`. It holds the store lock while reading the version and the entries (J9).
+
+**When it is fetched (D13):**
+- In `run_root_refresh`, after each `hello` round: for every peer whose accepted root version differs from its directory version (or that has none), send `directory` to all of them at once, bounded by `peer_timeout_ms`.
+- During a directory query, a peer that falls back to round 1 (15.3) also gets a background `tokio::spawn` fetch, so the next query can use the directory.
+- Only when `[rag] directory = true`.
+
+**Checks on a fetched directory**, against the peer's accepted `SignedRoot` from the registry:
+1. `root_version` must equal the registry's accepted version. If the peer is ahead, fetch `hello` once (as `root_at` does) and compare again. If it still differs, discard the answer and record status `no_root`.
+2. **Completeness (D14).** The entries' `cluster_id`s must be exactly `0..num_clusters-1`, each once, where `num_clusters` comes from the signed root. Missing, extra or repeated ids raise the flag `incomplete_directory`. Entries that verify are still kept.
+3. **Each entry.** `ClusterEntry::verify` (existing) **plus the position check:** the proof's sequence of `left` bits must equal `expected_sides(cluster_id, num_clusters)`:
+   ```
+   expected_sides(i, n):
+       sides = []
+       while n > 1:
+           if i is odd:        sides.push(true)        # sibling on the left
+           elif i + 1 < n:     sides.push(false)       # sibling on the right
+           # else: no step, the node moves up unchanged
+           i = i // 2;  n = (n + 1) // 2
+       return sides
+   ```
+   A failure raises `bad_centroid_proof`, and the entry is dropped.
+4. Store the verified entries as decoded `f32` vectors, with their `subtree_root`s, under the root version.
+
+The position check only rejects dishonest proofs: an honest `make_proof` always produces exactly this shape. For consistency it is used in **all three modes** (`two_round` round 1, `flat` cluster entries, `directory`) through one function, `ClusterEntry::verify_at(root, dim, num_clusters)`. M8 must rerun the M6 checks to show nothing changed for honest peers.
+
+Why the check works:
+- A tree's root also fixes how many leaves it has. If a peer signs `num_clusters = n` but built a tree with more leaves, at least one of the `n` proofs (in practice the last one, which walks the right-hand edge) cannot have the expected shape and still fold to the root.
+- M8 must confirm this with a unit test, not by argument alone: for every `n` from 1 to 40, build an honest tree with `n + 1` leaves, check its real proofs against a claimed `n`, and assert that at least one fails.
+
+### 15.3 Query flow (`retrieval = "directory"`)
+
+Run at the same time: local retrieval (unchanged) and `POST /embed [query]` on the own sidecar, giving `q`.
+
+1. **Targets.** Same as today: `split_targets` (registry `should_ask`; equivocators `refused`, down peers `skipped_stale`).
+2. **Split the targets:**
+   - *directory peers*: those with a directory entry whose version equals the registry's accepted version;
+   - *fallback peers*: the rest. If `directory_fallback`, they get the existing `round1()`, in parallel with step 3. Otherwise they are reported as `no_directory` and not asked.
+3. **Score locally.** One `Candidate` per directory entry, with `sim = dot(q, centroid)` and `claimed_best = None`, plus the candidates from fallback peers' round 1.
+   - `select_by = "best_chunk"` has no claims for directory entries, so `select_clusters` uses `sim` for them (its existing `unwrap_or(c.sim)`). Note this in the response's flags once per query (`select_by_centroid_for_directory`), so results aren't misread.
+4. **Select** with the existing `select_clusters(...)`.
+5. **Round 2** with the existing `round2()`. A `PeerState` for a directory peer is built from its directory entry: `offers` holds every cluster with its `subtree_root` and centroid, and `root_version` is the directory's version. So `check_chunks` and the subtree-root check are unchanged.
+6. **A stale root in round 2** (the peer re-ingested after our last refresh) is reported as today (`error`, "stale_root …"). The new root it carries is recorded in the registry, and a directory fetch for that peer is spawned. That query gets no chunks from that peer. There is no inline retry, to keep it simple.
+7. Rescore, merge and generate exactly as `two_round`.
+
+Output additions (section 6.4 extended):
+- `PeerResult.selected_via: Option<String>`: `"directory"` or `"round1"` (fallback, and always in `two_round`).
+- `PeerResult.bytes_sent` and `bytes_received` (u64): request and response bytes, summed over every request to that peer in this query. Counted in `request_peer`, for **all modes**, because M9 needs bytes per query.
+- `status` gains `"no_directory"`.
+- In directory mode `Timings.select` is the local scoring plus any fallback round 1.
+- `GET /rag/status` gains `directory`:
+  - `enabled`, `total_centroids`, `approx_bytes`;
+  - per peer: `root_version`, `clusters`, `complete`, `fetched_secs_ago`, `flags`.
+
+### 15.4 Adversary additions (section 9)
+
+- `fake_centroid` also corrupts `directory` answers (J34). Expected result: `bad_centroid_proof`, the peer has no usable entries, it falls back to round 1, fails there too, and gets no round 2.
+- New `hide_cluster`: drop the entry with the highest `cluster_id` from every `directory` answer. Expected result: `incomplete_directory`, and the remaining entries are used.
+- `tamper_text`, `inflate_score` and `equivocate` need no change. They must still be detected in directory mode.
+
+### 15.5 Files touched
+
+| File | Change |
+| :-- | :-- |
+| `rag/store.py` | `all_clusters()` |
+| `rag/server.py` | `GET /clusters` |
+| `tests/test_rag_store.py`, `tests/test_rag_server.py` | `all_clusters` returns `num_clusters` entries, ids `0..k-1`, each folding to the root; `/clusters` round trip |
+| `src/rag/merkle.rs` | `expected_sides`, `ClusterEntry::verify_at`; tests incl. the `n` vs `n+1` test and "every fixture proof has the expected shape" |
+| `src/rag/protocol.rs` | `RequestBody::Directory`, `ResponseBody::Directory`; responder; byte counting in `request_peer` (return the counts alongside the response) |
+| `src/rag/sidecar.rs` | `clusters()` client |
+| `src/rag/directory.rs` (new) | `CentroidDirectory`: per-peer verified entries; `update(peer, signed_root, response) -> (entries kept, flags)`; `candidates(q, peers)`; `status()`; unit tests; an `#[ignore]` scale test (below) |
+| `src/rag/retrieval.rs` | `directory()` pipeline (15.3); `verify_at` in round 1 and flat; `selected_via`, byte fields |
+| `src/rag/mod.rs` | `RetrievalMode::Directory`; `PeerResult` fields; directory fetch in `run_root_refresh`; directory in `RagService` |
+| `src/rag/adversary.rs` | `hide_cluster`; `fake_centroid` on `directory` |
+| `src/config.rs` | `directory`, `directory_fallback`; `Adversary::HideCluster`; validation: `retrieval = "directory"` requires `directory = true` |
+| `src/api.rs` | `directory` in `/rag/status`; a per-query `"retrieval": "directory"` with `directory = false` returns HTTP 400 `directory_disabled` |
+| `scripts/rag_run_questions.py` | accept `--retrieval directory` |
+| `examples/rag-2node/node*.toml` | `directory = true` (retrieval stays `two_round`), so all three modes can be run per query |
+| `CLAUDE.md`, `docs/explanation_merkle_tree.md` | describe the third mode |
+
+### 15.6 Steps and check
+
+Steps, in order. Run the unit tests after each:
+1. **M8a (Python):** `all_clusters`, `/clusters`, tests.
+2. **M8b (Rust, `merkle.rs`):** `expected_sides`, `verify_at`, tests. Switch round 1 and flat to `verify_at`.
+3. **M8c (protocol):** the `directory` kind, responder, sidecar client, byte counters, adversary additions.
+4. **M8d (`directory.rs`):** the directory, refresh integration, `/rag/status`.
+5. **M8e (retrieval):** the `directory` pipeline, fallback, config, API, script.
+
+**Check (all must pass and be recorded in section 14 as "Phase M8"):**
+1. Python tests, `cargo test --release`, and `rustfmt --check` on the new files all pass.
+2. **Scale test:** `cargo test --release directory_scale -- --ignored --nocapture`.
+   - It fills a directory with 1000 peers × 13 random unit centroids (dim 384), checks every entry's proof (built with a test-only tree builder), then times `candidates()` + `select_clusters()` over 100 random queries.
+   - Record the time to check all entries, the median and p95 per-query scoring time, and the memory estimate.
+   - Expected: scoring under 10 ms per query in release builds.
+3. **Live, `examples/rag-2node` + a temporary node 3** (as in M6), generator Ollama:
+   - (a) All 15 questions in **all three modes**. `node1_only` and `node2_only` should score as in M6 (6/6 each). Every remote context is `verified`. Two_round and flat match M6, so `verify_at` changed nothing.
+   - (b) In directory mode, after the first refresh: every peer has `selected_via = "directory"` and `round1_ms = null`, and round 2 went only to peers with `selected_clusters`.
+   - (c) Compare per question the clusters selected by `directory` and by `two_round`. They should agree except when a peer's 4th-or-later cluster ranks in the global top `max_clusters`, which two_round can't see. Report the agreement rate and every difference.
+   - (d) Median `select` time: directory vs two_round. Bytes per query in all three modes, from the new byte fields.
+   - (e) **Startup:** a query before the first refresh uses the fallback (`selected_via = "round1"`); a query after it uses the directory.
+   - (f) **Re-ingest:** ingest one document on node 2 through `/rag/ingest`. A query before node 1's next refresh shows the stale-root case from 15.3 step 6 (or, if the refresh already ran, a fresh directory at the new version). The next query after a refresh uses the new version. `/rag/status` shows the new `root_version` for node 2's directory.
+4. **Adversaries** in an isolated test federation (J36), directory mode: `fake_centroid` and `hide_cluster` detected as predicted in 15.4; `tamper_text`, `inflate_score` and `equivocate` detected as in M7; `FORGED` never appears in a context or answer.
+
+## 16. Phase M9 — Evaluation of all three modes on the HPC (plan)
+
+Planned 2026-10-22 (D16). This also covers Phases 5 (4/6/8 nodes) and 6 (evaluation) of `p2p_rag_plan.md`. Start only after M8 is done. The questions in 16.1 must be answered first, because several steps depend on them.
+
+### 16.1 Inputs needed before starting (ask the user and record the answers here)
+
+**Dataset**
+- Name, source and licence.
+- Format (PDF / text / JSON).
+- Number of documents and total size.
+- Language.
+- Are there **questions** with **gold answers**, and with **gold supporting documents or passages**? Recall needs gold passages or a single-index baseline. Answer accuracy needs gold answers.
+- Is there a natural split across "owners" (e.g. per institution or per topic) that should define the nodes?
+
+**HPC**
+- Scheduler (SLURM?).
+- Number of compute nodes available, and cores, RAM and GPU per node.
+- Job time limits.
+- Shared filesystem.
+- Container support (Apptainer / Singularity).
+- Internet access from compute nodes, for Hugging Face models, pip, cargo.
+- Can processes on **different compute nodes** reach each other over **UDP** (Iroh/QUIC needs it)? Which port ranges?
+- Is there a login node where builds run, and is it the same architecture as the compute nodes?
+
+**Models**
+- Embedding model. Keep MiniLM (comparable with M1–M8) or use a stronger one? It must be the same on every node. A larger `dim` affects message sizes (15.2) and the fixture-free parts only.
+- Generator for answer quality. Ollama may not be allowed on the HPC. The options are vLLM or `llama.cpp` behind the same Ollama-style API, or `generator = "none"` for retrieval-only metrics.
+
+**Scale**
+- Target node counts for the live runs, e.g. 2, 4, 8, 16, 32, 64. The 1000-node point is covered by the offline simulation (16.3).
+
+### 16.2 Preparation
+
+1. **`scripts/rag_prepare_dataset.py`** converts the dataset into:
+   - `datasets/<name>/docs/`
+   - `datasets/<name>/questions.jsonl`: `{id, question, answers: [...], gold_doc_ids: [...], gold_passages?: [...]}`
+   - `datasets/<name>/partitions/<scheme>-N<n>/node{i}/` for each partition scheme and node count. Use symlinks or copies, whichever the shared filesystem prefers.
+
+   Partition schemes, with the seed recorded:
+   - **`random`**: documents spread evenly at random (IID);
+   - **`topic`**: k-means on document embeddings, so each node holds mostly one topic (non-IID, closest to real federations);
+   - **`dirichlet`**: topic mixture per node drawn from Dirichlet(α), with α ∈ {0.1, 1.0}.
+2. **Embedding cache.** Embed every chunk **once** (GPU if available) and save `embeddings.npy` plus `chunks.jsonl` per dataset. The simulation (16.3) uses this cache directly.
+   - Live nodes ingest normally. Optionally, add a `rag_engine.py ingest --vectors` path that loads cached vectors to save time. That is a tool change, so log it as a decision if done.
+3. **Single-index baseline:** one index over the whole corpus, giving the "ideal" top-k for every question.
+4. **`scripts/rag_make_configs.py`** (planned in `p2p_rag_plan.md` Phase 5, not yet written). It writes N node configs with:
+   - unique ports, `data_dir`, `sidecar_port` and `corpus_dir`;
+   - the same `federation.id`;
+   - `[discovery]` all off (no mDNS, DHT, DNS or relay);
+   - `training.enabled = false`, `directory = true`;
+   - `network.peers` listing **every other node** as `<EndpointId>@<host>:<p2p_port>`. This sidesteps gossip's small neighbour view (section 12), so `peer_targets` = N−1.
+
+   Each EndpointId is only known after a node creates its identity. So add `iiitd --config X --print-endpoint-id`: create or load the identity in `data_dir`, print the EndpointId, and exit. This is a small `main.rs` change; log it as a decision. The config script runs it for every node first, then writes the `peers` lists.
+5. **HPC job scripts** in `scripts/hpc/`:
+   - `build.sh` (cargo build, Python venv);
+   - `rag_cluster.sbatch` (place N RAG nodes on M compute nodes, several per compute node, wait until every node's `/rag/status` shows N−1 `peer_targets` with `status: "ok"`, run the question set, collect logs and results, stop everything);
+   - one generator server per compute node, if answers are generated.
+6. **`scripts/rag_eval.py`** turns the saved JSONL responses (`rag_run_questions.py` output) into per-question rows and aggregate tables (CSV) and plots.
+
+### 16.3 Experiment A — offline routing simulation (1000 nodes, no networking)
+
+`scripts/rag_sim_routing.py` is pure Python. It reuses `rag/clustering.py` so clusters are built exactly as in the store, and it reads the embedding cache. For each partition scheme and N ∈ {10, 100, 1000}, and each question:
+- **global**: top `final_k` from the single index (the reference);
+- **flat**: each node's top `top_k`, merged to `final_k`;
+- **two_round**: each node offers its top `centroids_per_peer` centroids; global `select_clusters` (same rule as Rust); `chunks_per_cluster` from each winner; merged to `final_k`;
+- **directory**: every centroid of every node is a candidate; same selection and round 2.
+
+Metrics per question:
+- **recall@final_k** against the global top `final_k`;
+- **gold recall**: whether any gold passage or document is in the contexts, if gold exists;
+- **peers contacted** (round 1 + round 2);
+- **estimated bytes**, from the measured message sizes of M8 (bytes per centroid entry, per chunk);
+- for directory mode, **directory size per node**.
+
+Sweeps:
+- `n_clusters` ∈ {auto, 4, 8, 16, 32, 64};
+- `max_clusters` ∈ {1, 3, 5, 10};
+- `min_centroid_score` ∈ {0, 0.1, 0.2, 0.3};
+- `centroids_per_peer` ∈ {1, 3, 5} (two_round);
+- `select_by` (two_round).
+
+This is where "does centroid routing still find the right chunks at 1000 nodes" is answered.
+
+Check: a small run (N = 2, the M6 corpus) reproduces the clusters selected in the live M8 run for the same questions. This shows the simulation matches the real code.
+
+### 16.4 Experiment B — live federation on the HPC
+
+For N in the agreed list, for each partition scheme (at least `random` and `topic`), run every question in `flat`, `two_round` and `directory`, plus `scope: "local"` on one node, and compare with the single-index baseline.
+
+Record per query:
+- contexts with origin and verification;
+- answer, if a generator is used;
+- `timings_ms` (select, fetch, rescore, generate);
+- per peer: status, `selected_via`, `round1_ms`, `round2_ms`, bytes, flags.
+
+Also record per run:
+- directory memory and fetch bytes;
+- `hello` and `directory` refresh traffic per minute;
+- CPU time per node, if the scheduler reports it.
+
+Run each configuration at least 3 times, to report the spread of latency.
+
+### 16.5 Experiment C — adversaries at scale
+
+On one N (e.g. 16), in all three modes, make a fraction f ∈ {10%, 30%} of the nodes adversarial: one mode per run, `tamper_text`, `inflate_score`, `fake_centroid`, `hide_cluster`, `equivocate`.
+
+Measure:
+- the share of adversarial peers flagged (expected 100% for every mode that is detectable by design);
+- `FORGED` in any context or answer (expected 0);
+- the loss of recall and answer accuracy compared with f = 0. Rejected honest-looking data is lost evidence; see M7's results.
+
+### 16.6 Outputs
+
+- `results/m9/<experiment>/…` raw JSONL and CSV. Runtime output: keep it out of git, or commit only the small aggregate CSVs. Decide when starting.
+- Tables and plots, all against N:
+  - recall@k;
+  - answer accuracy;
+  - median and p95 latency, with breakdown;
+  - bytes per query;
+  - peers contacted per query;
+  - directory size;
+  - detection rate.
+- A "Phase M9" entry in section 14 with the headline numbers, and section 11's limits restated next to them.
+- Tick Phases 5 and 6 in `p2p_rag_plan.md` with a pointer here.
+
+### 16.7 Check
+
+- Every table in 16.6 is filled for the agreed N values.
+- The simulation reproduces the live clusters selected at N = 2 (16.3).
+- Any claim about 1000 nodes is labelled as coming from the simulation, not from live runs.
