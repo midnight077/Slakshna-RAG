@@ -453,7 +453,10 @@ impl RagService {
             if !seen.insert(entry.cluster_id) {
                 continue; // the same cluster offered twice counts once
             }
-            match (entry.verify(&root_hash, root.dim), entry.subtree_root()) {
+            match (
+                entry.verify_at(&root_hash, root.dim, root.num_clusters),
+                entry.subtree_root(),
+            ) {
                 (Ok(centroid), Ok(subtree_root)) => state.offers.push(Offer {
                     cluster_id: entry.cluster_id,
                     subtree_root,
@@ -618,7 +621,10 @@ impl RagService {
 
         let mut roots = HashMap::new();
         for entry in &clusters {
-            match (entry.verify(&root_hash, root.dim), entry.subtree_root()) {
+            match (
+                entry.verify_at(&root_hash, root.dim, root.num_clusters),
+                entry.subtree_root(),
+            ) {
                 (Ok(_), Ok(subtree_root)) => {
                     roots.insert(entry.cluster_id, subtree_root);
                 }

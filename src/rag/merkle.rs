@@ -153,6 +153,105 @@ impl ClusterEntry {
     }
 }
 
+/// The left/right pattern of an honest proof for leaf `index` of an `n`-leaf
+/// tree (section 2.2): one entry per step, `true` where the sibling is on the
+/// left. The last node of an odd-sized level moves up with no step.
+pub fn expected_sides(index: u32, n: u32) -> Vec<bool> {
+    let (mut i, mut n) = (index as u64, n as u64);
+    let mut sides = Vec::new();
+    while n > 1 {
+        if i % 2 == 1 {
+            sides.push(true);
+        } else if i + 1 < n {
+            sides.push(false);
+        }
+        i /= 2;
+        n = (n + 1) / 2;
+    }
+    sides
+}
+
+impl ClusterEntry {
+    /// `verify`, plus the position check (`docs/merkle_tree.md`, 15.2): the
+    /// cluster id must be one of the signed `num_clusters`, and the proof must
+    /// have exactly the shape an honest proof for that position has.
+    ///
+    /// Together with "a directory holds ids 0..num_clusters-1", this pins the
+    /// tree to exactly `num_clusters` leaves, so a peer cannot leave a cluster
+    /// out while its proofs still fold to the root.
+    pub fn verify_at(
+        &self,
+        root: &Hash,
+        dim: u32,
+        num_clusters: u32,
+    ) -> Result<Vec<f32>, BoxError> {
+        if self.cluster_id >= num_clusters {
+            return Err(format!(
+                "cluster {} is outside the {} signed clusters",
+                self.cluster_id, num_clusters
+            )
+            .into());
+        }
+        let sides: Vec<bool> = self.cluster_proof.iter().map(|step| step.left).collect();
+        if sides != expected_sides(self.cluster_id, num_clusters) {
+            return Err(format!(
+                "cluster {}'s proof does not have the shape of position {} of {}",
+                self.cluster_id, self.cluster_id, num_clusters
+            )
+            .into());
+        }
+        self.verify(root, dim)
+    }
+}
+
+/// Tree building and proofs in Rust, for tests only (the sidecar builds the
+/// real trees in Python). Used by this module's and `directory.rs`'s tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{inner_hash, Hash, ProofStep};
+
+    /// Every level of the tree over `nodes`, bottom first (section 2.2).
+    pub fn build_levels(nodes: &[Hash]) -> Vec<Vec<Hash>> {
+        let mut levels = vec![nodes.to_vec()];
+        while levels.last().unwrap().len() > 1 {
+            let level = levels.last().unwrap();
+            let mut upper: Vec<Hash> = level
+                .chunks_exact(2)
+                .map(|pair| inner_hash(&pair[0], &pair[1]))
+                .collect();
+            if level.len() % 2 == 1 {
+                upper.push(*level.last().unwrap());
+            }
+            levels.push(upper);
+        }
+        levels
+    }
+
+    pub fn root(levels: &[Vec<Hash>]) -> Hash {
+        levels.last().unwrap().first().copied().unwrap_or([0u8; 32])
+    }
+
+    /// The proof for node `index` of the bottom level (section 2.3).
+    pub fn make_proof(levels: &[Vec<Hash>], mut index: usize) -> Vec<ProofStep> {
+        let mut proof = Vec::new();
+        for level in &levels[..levels.len() - 1] {
+            if index % 2 == 1 {
+                proof.push(ProofStep {
+                    h: hex::encode(level[index - 1]),
+                    left: true,
+                });
+            } else if index + 1 < level.len() {
+                proof.push(ProofStep {
+                    h: hex::encode(level[index + 1]),
+                    left: false,
+                });
+            }
+            index /= 2;
+        }
+        proof
+    }
+}
+
 /// True if this chunk's proof leads from its id and text to `expected_subtree_root`.
 pub fn verify_chunk(
     chunk_id: &str,
@@ -542,6 +641,145 @@ mod tests {
             ..signed
         };
         assert!(!bad_root.verify(&test_key(1).public()));
+    }
+
+    fn sides(proof: &[ProofStep]) -> Vec<bool> {
+        proof.iter().map(|step| step.left).collect()
+    }
+
+    #[test]
+    fn every_fixture_proof_has_the_expected_shape() {
+        let f = fixture();
+        for tree in f["trees"].as_array().unwrap() {
+            let proofs = tree["proofs"].as_array().unwrap();
+            for (i, steps) in proofs.iter().enumerate() {
+                assert_eq!(
+                    sides(&proof(steps)),
+                    expected_sides(i as u32, proofs.len() as u32)
+                );
+            }
+        }
+        for case in f["commitments"].as_array().unwrap() {
+            let clusters = case["clusters"].as_array().unwrap();
+            for entry in clusters {
+                let id = entry["cluster_id"].as_u64().unwrap() as u32;
+                let expected = expected_sides(id, clusters.len() as u32);
+                assert_eq!(sides(&proof(&entry["cluster_proof"])), expected);
+            }
+            // A chunk's position is its place among its cluster's chunks.
+            let mut seen = std::collections::HashMap::new();
+            for chunk in case["chunks"].as_array().unwrap() {
+                let cluster = chunk["cluster"].as_u64().unwrap() as usize;
+                let position = seen.entry(cluster).or_insert(0u32);
+                let size = clusters[cluster]["size"].as_u64().unwrap() as u32;
+                assert_eq!(
+                    sides(&proof(&chunk["chunk_proof"])),
+                    expected_sides(*position, size)
+                );
+                *position += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn rust_proof_builder_matches_the_fixture() {
+        for tree in fixture()["trees"].as_array().unwrap() {
+            let leaves: Vec<Hash> = tree["leaves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(hash)
+                .collect();
+            let levels = testing::build_levels(&leaves);
+            assert_eq!(testing::root(&levels), hash(&tree["root"]));
+            for (i, steps) in tree["proofs"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(testing::make_proof(&levels, i), proof(steps));
+            }
+        }
+    }
+
+    /// `n` honest cluster entries (4-dim centroids) and their root.
+    fn honest_entries(n: u32) -> (Vec<ClusterEntry>, Hash) {
+        let centroids: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                [i as f32, 1.0, -0.5, 0.25]
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect()
+            })
+            .collect();
+        let subtrees: Vec<Hash> = (0..n)
+            .map(|i| Sha256::digest(i.to_be_bytes()).into())
+            .collect();
+        let leaves: Vec<Hash> = (0..n)
+            .map(|i| cluster_hash(i, 4, &centroids[i as usize], &subtrees[i as usize]))
+            .collect();
+        let levels = testing::build_levels(&leaves);
+        let entries = (0..n)
+            .map(|i| ClusterEntry {
+                cluster_id: i,
+                size: 1,
+                centroid: hex::encode(&centroids[i as usize]),
+                subtree_root: hex::encode(subtrees[i as usize]),
+                cluster_proof: testing::make_proof(&levels, i as usize),
+                best_chunk_score: None,
+            })
+            .collect();
+        (entries, testing::root(&levels))
+    }
+
+    #[test]
+    fn honest_proofs_pass_the_position_check() {
+        for n in 1..=40 {
+            let (entries, root) = honest_entries(n);
+            for entry in &entries {
+                assert!(
+                    entry.verify_at(&root, 4, n).is_ok(),
+                    "n={} id={}",
+                    n,
+                    entry.cluster_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tree_with_one_more_cluster_cannot_pass_as_n() {
+        // The plan's test (15.2): an honest tree with n + 1 leaves; its real
+        // proofs for ids 0..n-1, checked against a claimed n, must not all pass.
+        for n in 1..=40 {
+            let (entries, root) = honest_entries(n + 1);
+            let failures = entries[..n as usize]
+                .iter()
+                .filter(|entry| entry.verify_at(&root, 4, n).is_err())
+                .count();
+            assert!(
+                failures >= 1,
+                "n={}: every proof passed as {} clusters",
+                n,
+                n
+            );
+            // ...and the hidden cluster itself is outside the claimed range.
+            assert!(entries[n as usize].verify_at(&root, 4, n).is_err());
+        }
+    }
+
+    #[test]
+    fn position_check_rejects_wrong_ids_and_shapes() {
+        let (entries, root) = honest_entries(5);
+        assert!(entries[4].verify_at(&root, 4, 5).is_ok());
+        // A real proof presented under another id fails (the id is in the hash
+        // and the shape differs).
+        let moved = ClusterEntry {
+            cluster_id: 3,
+            ..entries[4].clone()
+        };
+        assert!(moved.verify_at(&root, 4, 5).is_err());
+        // Out of range, and no clusters at all.
+        assert!(entries[0].verify_at(&root, 4, 0).is_err());
+        let mut flipped = entries[0].clone();
+        flipped.cluster_proof[0].left = !flipped.cluster_proof[0].left;
+        assert!(flipped.verify_at(&root, 4, 5).is_err());
     }
 
     #[test]
