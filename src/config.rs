@@ -211,6 +211,8 @@ pub enum Adversary {
     FakeCentroid,
     /// On every other `hello`, sign a different root under the same version.
     Equivocate,
+    /// Leave the highest-numbered cluster out of every `directory` answer.
+    HideCluster,
 }
 
 /// Retrieval-augmented generation. Off unless `[rag] enabled = true`.
@@ -304,6 +306,15 @@ pub struct RagConfig {
     /// EXPERIMENTS ONLY: make this node misbehave towards peers. "none" by default.
     #[serde(default)]
     pub adversary: Adversary,
+    /// Directory mode (`docs/merkle_tree.md`, section 15): serve this node's
+    /// whole set of centroids to any allowed peer, and keep a verified copy of
+    /// peers' centroids so queries can pick clusters locally. Off by default,
+    /// because the directory reveals every topic this node holds.
+    #[serde(default)]
+    pub directory: bool,
+    /// In directory mode, ask peers without a fresh directory entry with round 1.
+    #[serde(default = "default_true")]
+    pub directory_fallback: bool,
 }
 
 fn default_sidecar_port() -> u16 { 8600 }
@@ -355,6 +366,8 @@ impl Default for RagConfig {
             drop_unverified: true,
             require_prior_root: false,
             adversary: Adversary::None,
+            directory: false,
+            directory_fallback: true,
         }
     }
 }

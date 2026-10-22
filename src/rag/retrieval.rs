@@ -15,7 +15,7 @@
 
 use super::merkle::{dot, verify_chunk, Hash, SignedRoot};
 use super::protocol::{
-    self, ProvenChunk, RagRequest, RagResponse, RequestBody, ResponseBody, StaleRoot,
+    self, ByteCount, ProvenChunk, RagRequest, RagResponse, RequestBody, ResponseBody, StaleRoot,
 };
 use super::registry::FLAG_EQUIVOCATION;
 use super::{Chunk, PeerLink, PeerResult, RagService};
@@ -216,6 +216,8 @@ struct PeerState {
     /// Round 2 (or the flat round) answered.
     answered: bool,
     chunks: Vec<Chunk>,
+    /// Bytes exchanged with this peer during this query.
+    bytes: ByteCount,
 }
 
 impl PeerState {
@@ -230,6 +232,7 @@ impl PeerState {
             selected: Vec::new(),
             answered: false,
             chunks: Vec::new(),
+            bytes: ByteCount::default(),
         }
     }
 
@@ -244,6 +247,8 @@ impl PeerState {
         self.result.selected_clusters = self.selected.clone();
         self.result.rtt_ms =
             self.result.round1_ms.unwrap_or(0) + self.result.round2_ms.unwrap_or(0);
+        self.result.bytes_sent = self.bytes.sent;
+        self.result.bytes_received = self.bytes.received;
         (self.result, self.chunks)
     }
 }
@@ -299,6 +304,7 @@ impl RagService {
         peer: EndpointId,
         body: RequestBody,
         timeout_ms: u64,
+        bytes: &mut ByteCount,
     ) -> (Sent, u64) {
         let started = Instant::now();
         let request = RagRequest::new(body);
@@ -309,6 +315,7 @@ impl RagService {
                 peer,
                 &request,
                 self.config.max_message_bytes,
+                bytes,
             ),
         )
         .await;
@@ -376,11 +383,16 @@ impl RagService {
         peer: EndpointId,
         root_version: u64,
         query_started: Instant,
+        bytes: &mut ByteCount,
     ) -> Option<(SignedRoot, bool)> {
         if let Some(found) = self.registered_root(&peer, root_version, query_started) {
             return Some(found);
         }
-        self.hello_peer(&link.endpoint, peer).await;
+        let hello = self.hello_peer(&link.endpoint, peer).await;
+        bytes.add(ByteCount {
+            sent: hello.bytes_sent,
+            received: hello.bytes_received,
+        });
         self.registered_root(&peer, root_version, query_started)
     }
 
@@ -399,7 +411,13 @@ impl RagService {
             n: self.config.centroids_per_peer,
         };
         let (sent, ms) = self
-            .send(link, peer, body, self.config.select_timeout_ms)
+            .send(
+                link,
+                peer,
+                body,
+                self.config.select_timeout_ms,
+                &mut state.bytes,
+            )
             .await;
         state.result.round1_ms = Some(ms);
 
@@ -434,7 +452,9 @@ impl RagService {
         state.result.root_version = Some(root_version);
         state.result.offered_clusters = centroids.len();
 
-        let Some((root, new_root)) = self.root_at(link, peer, root_version, query_started).await
+        let Some((root, new_root)) = self
+            .root_at(link, peer, root_version, query_started, &mut state.bytes)
+            .await
         else {
             state.fail(
                 "no_root",
@@ -478,7 +498,13 @@ impl RagService {
             per_cluster: self.config.chunks_per_cluster,
         };
         let (sent, ms) = self
-            .send(link, state.peer, body, self.config.peer_timeout_ms)
+            .send(
+                link,
+                state.peer,
+                body,
+                self.config.peer_timeout_ms,
+                &mut state.bytes,
+            )
             .await;
         state.result.round2_ms = Some(ms);
 
@@ -569,7 +595,13 @@ impl RagService {
             top_k,
         };
         let (sent, ms) = self
-            .send(link, peer, body, self.config.peer_timeout_ms)
+            .send(
+                link,
+                peer,
+                body,
+                self.config.peer_timeout_ms,
+                &mut state.bytes,
+            )
             .await;
         state.result.round1_ms = Some(ms);
 
@@ -605,7 +637,9 @@ impl RagService {
         state.result.root_version = Some(root_version);
         state.result.offered_clusters = clusters.len();
 
-        let Some((root, new_root)) = self.root_at(link, peer, root_version, query_started).await
+        let Some((root, new_root)) = self
+            .root_at(link, peer, root_version, query_started, &mut state.bytes)
+            .await
         else {
             state.fail(
                 "no_root",

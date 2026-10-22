@@ -35,7 +35,7 @@ const MAX_CENTROIDS: usize = 10;
 const MAX_CLUSTERS: usize = 10;
 const MAX_PER_CLUSTER: usize = 10;
 
-/// One request: common fields plus one of the four kinds.
+/// One request: common fields plus one of the five kinds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagRequest {
     pub v: u32,
@@ -67,6 +67,10 @@ pub enum RequestBody {
         query: String,
         top_k: usize,
     },
+    /// Directory mode: every cluster entry of the peer's current root
+    /// (`docs/merkle_tree.md`, 15.2). Answered only by nodes with
+    /// `[rag] directory = true`.
+    Directory,
 }
 
 impl RequestBody {
@@ -76,6 +80,7 @@ impl RequestBody {
             RequestBody::Centroids { .. } => "centroids",
             RequestBody::Chunks { .. } => "chunks",
             RequestBody::Search { .. } => "search",
+            RequestBody::Directory => "directory",
         }
     }
 }
@@ -153,6 +158,11 @@ pub enum ResponseBody {
         chunks: Vec<ProvenChunk>,
         retrieve_ms: u64,
     },
+    /// Every cluster entry of the peer's root at `root_version`.
+    Directory {
+        root_version: u64,
+        clusters: Vec<ClusterEntry>,
+    },
     /// The request failed; `error` says why.
     Error,
 }
@@ -164,6 +174,7 @@ impl ResponseBody {
             ResponseBody::Centroids { .. } => "centroids",
             ResponseBody::Chunks { .. } => "chunks",
             ResponseBody::Search { .. } => "search",
+            ResponseBody::Directory { .. } => "directory",
             ResponseBody::Error => "error",
         }
     }
@@ -173,6 +184,7 @@ impl ResponseBody {
         match self {
             ResponseBody::Hello { .. } | ResponseBody::Error => 0,
             ResponseBody::Centroids { centroids, .. } => centroids.len(),
+            ResponseBody::Directory { clusters, .. } => clusters.len(),
             ResponseBody::Chunks { chunks, .. } | ResponseBody::Search { chunks, .. } => chunks.len(),
         }
     }
@@ -316,6 +328,16 @@ impl RagProtocol {
                     None,
                 ))
             }
+            RequestBody::Directory => {
+                // The directory reveals every topic this node holds (D12), so
+                // it is served only when switched on.
+                if !service.config.directory {
+                    return Err("this node does not serve a centroid directory ([rag] directory = false)".into());
+                }
+                let result = service.sidecar.clusters().await?;
+                service.ensure_root_version(result.root_version).await;
+                Ok((ResponseBody::Directory { root_version: result.root_version, clusters: result.clusters }, None))
+            }
         }
     }
 }
@@ -361,22 +383,43 @@ impl ProtocolHandler for RagProtocol {
     }
 }
 
+/// Bytes exchanged with one peer: the JSON request written and the JSON
+/// response read (QUIC and TLS overhead not included).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ByteCount {
+    pub sent: u64,
+    pub received: u64,
+}
+
+impl ByteCount {
+    pub fn add(&mut self, other: ByteCount) {
+        self.sent += other.sent;
+        self.received += other.received;
+    }
+}
+
 /// The asking side: send one request to one peer and read its response.
 ///
 /// Fails if the peer reports an error, answers another query, or answers with
 /// a different kind. A `stale_root` refusal fails with a `StaleRoot` error
 /// (find it with `downcast_ref`), which carries the peer's current root.
+/// The bytes written and read are added to `bytes` as they happen, so they
+/// are counted even when the request fails or is cut off by a timeout.
 pub async fn request_peer(
     endpoint: &Endpoint,
     peer: EndpointId,
     request: &RagRequest,
     max_message_bytes: usize,
+    bytes: &mut ByteCount,
 ) -> Result<RagResponse, BoxError> {
+    let request_bytes = serde_json::to_vec(request)?;
     let connection = endpoint.connect(peer, RAG_ALPN).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    send.write_all(&serde_json::to_vec(request)?).await?;
+    send.write_all(&request_bytes).await?;
+    bytes.sent += request_bytes.len() as u64;
     send.finish()?;
     let response_bytes = recv.read_to_end(max_message_bytes).await?;
+    bytes.received += response_bytes.len() as u64;
     connection.close(0u32.into(), b"done");
 
     let response: RagResponse = serde_json::from_slice(&response_bytes)?;
@@ -457,6 +500,7 @@ mod tests {
                 RequestBody::Search { query: "x".into(), top_k: 5 },
                 json!({"v": 2, "kind": "search", "query_id": "q", "query": "x", "top_k": 5}),
             ),
+            (RequestBody::Directory, json!({"v": 2, "kind": "directory", "query_id": "q"})),
         ];
         for (body, expected) in cases {
             let request = RagRequest { v: 2, query_id: "q".into(), body: body.clone() };
@@ -487,6 +531,27 @@ mod tests {
         assert!(value.get("root").is_none());
         let parsed: RagResponse = serde_json::from_value(value).unwrap();
         assert!(matches!(parsed.body, ResponseBody::Chunks { root_version: u64::MAX, .. }));
+    }
+
+    #[test]
+    fn directory_answers_match_the_documented_json() {
+        // The shape from docs/merkle_tree.md, 15.2.
+        let request = RagRequest::new(RequestBody::Directory);
+        let answer = response(&request.query_id, None, ResponseBody::Directory {
+            root_version: 7,
+            clusters: Vec::new(),
+        });
+        let value = serde_json::to_value(&answer).unwrap();
+        assert_eq!(value["kind"], "directory");
+        assert_eq!(value["root_version"], 7);
+        assert!(value["clusters"].as_array().unwrap().is_empty());
+        let parsed: RagResponse = serde_json::from_value(value).unwrap();
+        assert!(check_response(&request, parsed).is_ok());
+
+        // An older build answers the new kind with an error, which the asker
+        // turns into "no directory from this peer".
+        let refused = response(&request.query_id, Some("unknown variant `directory`"), ResponseBody::Error);
+        assert!(check_response(&request, refused).is_err());
     }
 
     #[test]

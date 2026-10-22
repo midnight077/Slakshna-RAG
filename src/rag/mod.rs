@@ -105,6 +105,10 @@ pub struct PeerResult {
     pub flags: Vec<String>,
     pub round1_ms: Option<u64>,
     pub round2_ms: Option<u64>,
+    /// JSON bytes sent to and received from this peer during this query, over
+    /// every request (round 1, round 2, a search, or an inline `hello`).
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -125,6 +129,8 @@ pub struct PeerHello {
     /// What the root registry made of `root`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<RootOutcome>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -143,6 +149,8 @@ impl PeerResult {
             flags: Vec::new(),
             round1_ms: None,
             round2_ms: None,
+            bytes_sent: 0,
+            bytes_received: 0,
             error: None,
         }
     }
@@ -286,9 +294,10 @@ impl RagService {
     pub async fn hello_peer(&self, endpoint: &iroh::Endpoint, peer: iroh::EndpointId) -> PeerHello {
         let started = Instant::now();
         let request = RagRequest::new(RequestBody::Hello);
+        let mut bytes = protocol::ByteCount::default();
         let outcome = tokio::time::timeout(
             Duration::from_millis(self.config.select_timeout_ms),
-            protocol::request_peer(endpoint, peer, &request, self.config.max_message_bytes),
+            protocol::request_peer(endpoint, peer, &request, self.config.max_message_bytes, &mut bytes),
         ).await;
 
         let mut result = PeerHello {
@@ -299,6 +308,8 @@ impl RagService {
             root: None,
             signature_valid: false,
             outcome: None,
+            bytes_sent: bytes.sent,
+            bytes_received: bytes.received,
             error: None,
         };
         let now = Instant::now();

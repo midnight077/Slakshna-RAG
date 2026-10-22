@@ -6,7 +6,7 @@
 //! before sending it. The asking side is unchanged, so this tests whether its
 //! checks catch each attack. Never set it outside an experiment.
 
-use super::merkle::{ClusterEntry, Commitment, SignedRoot};
+use super::merkle::{decode_f32le, ClusterEntry, Commitment, SignedRoot};
 use super::protocol::{ProvenChunk, RequestBody, ResponseBody};
 use super::RagService;
 use crate::config::Adversary;
@@ -69,6 +69,34 @@ pub fn fake_centroids(entries: &mut [ClusterEntry], query_vec: &[f32]) {
     }
 }
 
+/// The normalised sum of all `entries`' centroids: a vector close to every
+/// topic the node holds. `fake_centroid` sends it in `directory` answers,
+/// which carry no query to copy. `None` if there are no usable centroids.
+pub fn mean_direction(entries: &[ClusterEntry]) -> Option<Vec<f32>> {
+    let mut sum: Vec<f32> = Vec::new();
+    for entry in entries {
+        let dim = (entry.centroid.len() / 8) as u32;
+        let Ok(centroid) = decode_f32le(&entry.centroid, dim) else {
+            continue;
+        };
+        if sum.is_empty() {
+            sum = vec![0.0; centroid.len()];
+        }
+        if centroid.len() == sum.len() {
+            sum.iter_mut().zip(&centroid).for_each(|(s, c)| *s += c);
+        }
+    }
+    let norm = sum.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (norm > 0.0).then(|| sum.iter().map(|x| x / norm).collect())
+}
+
+/// Remove the entry with the highest cluster id (`hide_cluster`).
+pub fn hide_last_cluster(entries: &mut Vec<ClusterEntry>) {
+    if let Some(last) = entries.iter().map(|e| e.cluster_id).max() {
+        entries.retain(|e| e.cluster_id != last);
+    }
+}
+
 /// A second, different root with the same version as `real`, properly signed
 /// with this node's key: the real root with its first byte flipped.
 pub fn equivocating_root(secret: &SecretKey, real: &SignedRoot) -> Result<SignedRoot, BoxError> {
@@ -99,11 +127,17 @@ impl RagService {
             }
             Adversary::InflateScore => inflate_scores(body),
             Adversary::FakeCentroid => {
+                if let ResponseBody::Directory { clusters, .. } = body {
+                    if let Some(fake) = mean_direction(clusters) {
+                        fake_centroids(clusters, &fake);
+                    }
+                    return;
+                }
                 let query = match request {
                     RequestBody::Centroids { query, .. }
                     | RequestBody::Chunks { query, .. }
                     | RequestBody::Search { query, .. } => query,
-                    RequestBody::Hello => return,
+                    RequestBody::Hello | RequestBody::Directory => return,
                 };
                 let query_vec = match self.sidecar.embed(&[query.as_str()]).await {
                     Ok(mut vectors) if !vectors.is_empty() => vectors.remove(0),
@@ -119,6 +153,11 @@ impl RagService {
                     ResponseBody::Chunks { clusters, .. }
                     | ResponseBody::Search { clusters, .. } => fake_centroids(clusters, &query_vec),
                     _ => {}
+                }
+            }
+            Adversary::HideCluster => {
+                if let ResponseBody::Directory { clusters, .. } = body {
+                    hide_last_cluster(clusters);
                 }
             }
             Adversary::Equivocate => {
@@ -235,6 +274,27 @@ mod tests {
         assert!(entries.iter().all(|e| e.verify(&root, 4).is_ok()));
         fake_centroids(&mut entries, &[1.0, 0.0, 0.0, 0.0]);
         assert!(entries.iter().all(|e| e.verify(&root, 4).is_err()));
+    }
+
+    #[test]
+    fn directory_attacks_change_what_is_sent() {
+        let (_, mut entries, _, root) = fixture();
+        // hide_cluster: the highest id is gone, the rest is untouched.
+        let mut hidden = entries.clone();
+        hide_last_cluster(&mut hidden);
+        assert_eq!(
+            hidden.iter().map(|e| e.cluster_id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(hidden.iter().all(|e| e.verify_at(&root, 4, 3).is_ok()));
+
+        // fake_centroid on a directory: a unit vector replaces every centroid,
+        // and every entry then fails its proof.
+        let fake = mean_direction(&entries).unwrap();
+        let norm: f32 = fake.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+        fake_centroids(&mut entries, &fake);
+        assert!(entries.iter().all(|e| e.verify_at(&root, 4, 3).is_err()));
     }
 
     #[test]

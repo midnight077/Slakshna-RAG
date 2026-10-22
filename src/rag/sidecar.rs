@@ -42,6 +42,13 @@ pub struct ProvenChunks {
     pub chunks: Vec<ProvenChunk>,
 }
 
+/// A node's whole centroid directory (`GET /clusters`).
+#[derive(Debug, Deserialize)]
+pub struct ClustersResponse {
+    pub root_version: u64,
+    pub clusters: Vec<ClusterEntry>,
+}
+
 /// Result of `/search_clusters`. Cluster ids only mean something under one
 /// root, so the sidecar refuses a request made for another version.
 #[derive(Debug)]
@@ -157,6 +164,18 @@ impl SidecarClient {
             .await
             .map_err(|e| format!("RAG sidecar unreachable at {}: {}", self.base_url, e))?;
         read_json("/commitment", response).await
+    }
+
+    /// Every cluster entry of the current root, for peers' directory mode.
+    pub async fn clusters(&self) -> Result<ClustersResponse, BoxError> {
+        let response = self
+            .http
+            .get(format!("{}/clusters", self.base_url))
+            .timeout(RETRIEVE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("RAG sidecar unreachable at {}: {}", self.base_url, e))?;
+        read_json("/clusters", response).await
     }
 
     pub async fn centroids(&self, query: &str, n: usize) -> Result<CentroidsResponse, BoxError> {
