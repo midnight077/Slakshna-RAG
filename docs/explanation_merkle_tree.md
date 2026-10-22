@@ -1,6 +1,6 @@
 # Verifiable, cluster-routed retrieval explained
 
-This document explains the work done on branch `merkle-tree`: Phases M1–M6 of `docs/merkle_tree.md`. It assumes you know the basic peer-to-peer RAG setup from `docs/p2p_rag_plan.md`: two nodes, each with a Python sidecar that holds a document index, and one node asking the other for text chunks.
+This document explains the work done on branch `merkle-tree`: Phases M1–M7 of `docs/merkle_tree.md`. It assumes you know the basic peer-to-peer RAG setup from `docs/p2p_rag_plan.md`: two nodes, each with a Python sidecar that holds a document index, and one node asking the other for text chunks.
 
 It covers:
 - what was built and why;
@@ -10,7 +10,7 @@ It covers:
 - how to read the outputs;
 - what the measurements showed, and what is still not protected.
 
-Phases M7 (simulated attackers) and M8 (evaluation) are not done yet.
+Phase M8 (evaluation) is not done yet.
 
 ---
 
@@ -655,8 +655,11 @@ All settings have defaults, so older config files still load. The ones added in 
 | `select_timeout_ms` | `2000` | Timeout for `hello` and round 1. |
 | `root_refresh_secs` | `60` | How often all peers' roots are fetched again. |
 | `peer_stale_secs` | `180` | A peer silent for longer is skipped. |
+| `adversary` | `"none"` | **Experiments only.** `tamper_text`, `inflate_score`, `fake_centroid` or `equivocate` makes this node attack its peers (section 15). |
 
-The earlier settings still apply: `top_k`, `final_k`, `peer_timeout_ms` (5000, used for round 2 and flat), `max_message_bytes`, `generator` and so on. `adversary` (simulated attacks) comes in Phase M7.
+The earlier settings still apply: `top_k`, `final_k`, `peer_timeout_ms` (5000, used for round 2 and flat), `max_message_bytes`, `generator` and so on.
+
+One more setting, for experiments only: `adversary` (default `"none"`) makes the node attack its peers on purpose (section 15).
 
 The node refuses to start if a value is out of range, for example `max_clusters = 0`, `min_centroid_score = 1.5`, `n_clusters = 100` or `retrieval = "fast"`.
 
@@ -682,16 +685,17 @@ The node refuses to start if a value is out of range, for example `max_clusters 
 
 ```bash
 cargo test --release
-rustfmt --edition 2021 --check src/rag/merkle.rs src/rag/registry.rs src/rag/retrieval.rs
+rustfmt --edition 2021 --check src/rag/merkle.rs src/rag/registry.rs src/rag/retrieval.rs src/rag/adversary.rs
 ```
 
-31 tests. The `rustfmt` check covers only the new files: older files keep their own brace style (decision I5), so `cargo fmt --check` over the whole tree is expected to fail.
+35 tests. The `rustfmt` check covers only the new files: older files keep their own brace style (decision I5), so `cargo fmt --check` over the whole tree is expected to fail.
 
 | Module | Checks |
 | :-- | :-- |
 | `rag::merkle` | The shared fixture (every hash, tree, proof, edge case and the signed-message bytes); a sign/verify round trip; another key, a changed version, a changed model or a malformed signature all fail. |
 | `rag::protocol` | Each request serialises to the JSON shape in the plan; large versions round-trip; mismatched ids, kinds and errors are rejected; `stale_root` carries the new root. |
 | `rag::registry` | Accept, unchanged, bad signature, rollback, equivocation with evidence; who is asked and who is skipped; the status lines. |
+| `rag::adversary` | Each simulated attack, applied to fixture data, is caught by the real checks: tampered chunks fail, inflated scores are flagged, fake centroids fail, a second root under one version is equivocation. |
 | `rag::retrieval` | Cluster selection (ranking, cap, threshold, always-keep-best, `best_chunk` mode); fixture chunks verify, tampered ones are dropped; unrequested and over-cap chunks are rejected; rescoring replaces scores and flags inflated ones; overclaims are found. |
 
 ### 12.3 The shared test vectors
@@ -724,6 +728,7 @@ These are not automated; they were run by hand for each phase and are recorded i
 | M5 | With a dead remembered peer, peer retrieval fell from 5001 ms to about 30 ms after the first refresh. With rule J23, a peer that just died costs one timed-out question. |
 | HNSW switch (decision C10) | Same top 5 as exact search for all 365 test queries on both indexes. All 15 questions in both modes gave the same contexts, in the same order; `node2_only` still 6/6, every remote context `verified`. Roots unchanged. |
 | M6 | 15 questions, both modes, one machine and two machines: `node1_only` 6/6, `node2_only` 6/6, `cross_node` 0/3. Every remote context `verified`, no flags. Peer work about 0.4 s (two_round) or 0.24 s (flat), mostly re-embedding; VPN round trips 21–68 ms. |
+| M7 | Each of the four simulated attacks was caught with the predicted flag, in both modes; `FORGED` text never reached a context or an answer; an equivocating peer was refused (section 15). |
 
 Two observations to carry into M8:
 - **Selection rarely leaves a peer out with the defaults.** With 2 peers × 3 centroids competing for 5 places, and unrelated topics still scoring above 0.2 with this model, both peers usually win something. A third node did get no round 2 for a question outside its topic. `max_clusters` and `min_centroid_score` need tuning in the evaluation.
@@ -743,9 +748,47 @@ From `docs/merkle_tree.md`, section 11. Keep these in mind for any write-up:
 
 ---
 
-## 15. What comes next
+## 15. Simulated attackers (Phase M7)
 
-- **M7, simulated attackers.** An `adversary` setting makes a node misbehave on purpose: change chunk text, inflate scores, fake centroids, or sign two roots under one version. The check is that each attack is caught with the expected flag and no tampered text reaches the answer.
-- **M8, evaluation.** Compare `flat` and `two_round` at 2, 4, 6 and 8 nodes: retrieval quality, answer accuracy, peers contacted, bytes sent, time spent, and detection rate. Sweep `n_clusters`, `max_clusters`, `min_centroid_score` and `select_by`.
+To test the checks against real attacks, a node can be told to misbehave towards its peers with `[rag] adversary` in its config. It answers each request honestly through its sidecar, then corrupts the answer just before sending it (`src/rag/adversary.rs`, called from `protocol.rs`). The asking node is unchanged. **Never set this outside an experiment.** A node with it on logs `😈 [rag] adversary = …: this node will send corrupted answers to peers. EXPERIMENTS ONLY.` at startup.
 
-The design decisions behind everything above are listed, with reasons, in `docs/decisions.md` (sections I and J).
+| `adversary` | What the node does to its answers | What the asking node does |
+| :-- | :-- | :-- |
+| `tamper_text` | Replaces the middle word of every chunk with `FORGED`. | The chunk's leaf hash changes, so its proof fails. The chunk is dropped; flag `bad_chunk_proof`; `rejected_chunks` counts it. |
+| `inflate_score` | Adds 0.3 to every chunk score and every `best_chunk_score`. | Rescoring gives its own score; `claimed_score − score = 0.3`. Flag `score_mismatch`, and in two_round `score_overclaim` (the claimed best chunk is never delivered). The chunks are genuine, so they are kept, ranked by the real scores. |
+| `fake_centroid` | Replaces every centroid it sends with the query's embedding, which would have similarity 1 and always win. | The centroid is inside the cluster hash, so the cluster proof fails. Flag `bad_centroid_proof`; the peer wins no cluster and gets no round 2. In flat mode the chunks under the failed entries are rejected too. |
+| `equivocate` | On every other `hello`, sends a second root (the real one with its first byte flipped) under the same version, properly signed. | The registry sees two different signed roots with one version: flag `equivocation`, both kept as `evidence`, and from then on the peer is `refused` (not asked). |
+
+### How the check was run
+
+The attacks were tested in an isolated test federation, so the misbehaving node could not reach or be remembered by the real nodes:
+1. Make copies of `examples/rag-2node/node1.toml` and `node2.toml` with a different `[federation] id`, other ports, `peers = []` and scratch `data_dir`s.
+2. In node 2's copy, add `adversary = "tamper_text"` (or another mode) to `[rag]`.
+3. Start both, wait about 10 s, and run `python3 scripts/rag_run_questions.py --api http://localhost:<node 1 api port> --retrieval two_round --ids q07,q08,q09,q10,q11,q12 --out …` (and again with `--retrieval flat`).
+4. For `equivocate`: ask one question, call `curl localhost:<port>/rag/debug/hello` (the second `hello`), then ask again. The peer is now `refused`.
+5. Restart both nodes before the next mode: flags live in memory, and an equivocating peer stays refused until node 1 restarts.
+
+### Results (2026-10-22)
+
+| Mode | Flags on node 2 | Effect | `FORGED` in contexts or answer |
+| :-- | :-- | :-- | :-- |
+| `tamper_text` | `bad_chunk_proof` | every chunk rejected (7–9 per question in two_round, 5 in flat) | never |
+| `inflate_score` | `score_mismatch` (+ `score_overclaim` in two_round) | chunks kept, all re-scored down by exactly 0.3 | never |
+| `fake_centroid` | `bad_centroid_proof` (+ `bad_chunk_proof` in flat) | node 2 selected for nothing; no round 2 | never |
+| `equivocate` | `equivocation`, 2 roots in `evidence` | first question normal; after the second `hello`, node 2 `refused` | never |
+
+What to read from the outputs:
+- `peers[].flags` names the attack.
+- `peers[].rejected_chunks` shows how many chunks were thrown away.
+- `contexts[].claimed_score` shows inflated claims.
+- `/rag/status` → `registry[].flags` and `evidence` keep the record; a refused peer shows `asked_in_queries: false`.
+
+With node 2's chunks rejected, the node-2 questions were answered from node 1's own (unrelated) chunks, and mostly wrongly, e.g. q07 "Allahabad". The checks keep forged text out; they cannot supply the missing evidence. Flags other than `equivocation` are only recorded. A peer caught tampering is still asked next time; acting on flags (trust scores) is a later step.
+
+---
+
+## 16. What comes next
+
+- **M8, evaluation.** Compare `flat` and `two_round` at 2, 4, 6 and 8 nodes: retrieval quality, answer accuracy, peers contacted, bytes sent, time spent, and detection rate per attack. Sweep `n_clusters`, `max_clusters`, `min_centroid_score` and `select_by`.
+
+The design decisions behind everything above are listed, with reasons, in `docs/decisions.md` (sections C, I and J).

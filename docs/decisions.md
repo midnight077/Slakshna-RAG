@@ -293,3 +293,21 @@ It is the asker's similarity by default, or the claimed best chunk score with `s
 **J31. A selected cluster that delivers no verified chunk counts as an overclaim (Claude, 2026-10-19).**
 This is only checked if round 2 answered at all; a timeout is not an overclaim.
 *Why:* the peer claimed a chunk with that score exists and then did not send one. That is the same promise broken as sending a worse chunk.
+
+**J32. Simulated attacks run on the answering side, after the honest answer (Claude, 2026-10-22).**
+They live in `src/rag/adversary.rs`, are switched by `[rag] adversary` (`"none"` by default), and the node logs a warning at startup whenever one is on.
+*Why:* this follows the plan (section 9). The node corrupts exactly what a dishonest peer would control, its own reply, while the sidecar, the proofs it computes and the asking side stay real. A detection is then a detection by the production checks, not by test code.
+
+**J33. `tamper_text` writes the marker word `FORGED` into each chunk (Claude, 2026-10-22).**
+It replaces the middle word.
+*Why:* any one-word change breaks the proof equally. A distinctive marker makes "no tampered text reached the answer" a simple search over every context and answer.
+
+**J34. `fake_centroid` corrupts the cluster entries of every answer kind, not only round 1 (Claude, 2026-10-22).**
+*Why:* a real attacker would lie consistently. It also tests flat mode, where corrupted entries make the chunks under them fail as well.
+
+**J35. `equivocate` flips the first byte of the real root and signs it under the same version; "every other hello" counts all peers' hellos together (Claude, 2026-10-22).**
+*Why:* it is the simplest second root that is properly signed and clearly different. A single counter needs no per-peer state; with one asking peer in the test, it alternates exactly.
+
+**J36. Live attack tests use an isolated test federation with fresh data (Claude, 2026-10-22).**
+The nodes get their own federation id, ports and scratch data folders, and both are restarted for each mode.
+*Why:* a misbehaving node must not join, or be remembered by, the real nodes and their RocksDB peer lists. Restarting the honest node between modes clears its in-memory flags, so each mode is judged on its own. The same set-up was used to check the HNSW switch end to end (C10), because a real node was running at the time.

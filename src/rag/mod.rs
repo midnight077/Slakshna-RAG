@@ -4,6 +4,7 @@
 //! local Python sidecar (`rag_engine.py`). This module is the node's side of
 //! that — the sidecar client and the query pipeline behind `POST /rag/query`.
 
+pub mod adversary;
 pub mod merkle;
 pub mod protocol;
 pub mod registry;
@@ -19,6 +20,7 @@ use serde::{ Deserialize, Serialize };
 use sha2::{ Digest, Sha256 };
 use sidecar::SidecarClient;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU64;
 use std::sync::{ Arc, Mutex, MutexGuard };
 use std::time::{ Duration, Instant };
 use tokio::sync::RwLock;
@@ -200,6 +202,8 @@ pub struct RagService {
     own_root: RwLock<Option<SignedRoot>>,
     /// Peers' signed roots and when each peer last answered.
     registry: Mutex<RootRegistry>,
+    /// `hello` answers given, used only by `[rag] adversary = "equivocate"`.
+    hellos_served: AtomicU64,
 }
 
 impl RagService {
@@ -211,6 +215,7 @@ impl RagService {
             secret_key,
             own_root: RwLock::new(None),
             registry: Mutex::new(RootRegistry::default()),
+            hellos_served: AtomicU64::new(0),
         }
     }
 

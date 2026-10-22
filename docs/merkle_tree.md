@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M6 done (M6 on 2026-10-19); M7–M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M7 done (M7 on 2026-10-22); M8 not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -486,7 +486,7 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M4 — wire protocol v2 and own signed root (done 2026-10-18; see section 14)
 - [x] Phase M5 — root registry and stale-peer skipping (done 2026-10-18; see section 14)
 - [x] Phase M6 — two-round query and flat mode (done 2026-10-19, on one machine and across both; see section 14)
-- [ ] Phase M7 — simulated adversaries
+- [x] Phase M7 — simulated adversaries (done 2026-10-22; see section 14)
 - [ ] Phase M8 — evaluation
 
 ## 14. Results
@@ -688,3 +688,32 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, J24–J
 - `min_centroid_score` applies to the ranking key (the similarity, or the claimed best score with `select_by = "best_chunk"`).
 - `score_overclaim` is also raised when a selected cluster delivered no verified chunk at all, but only if round 2 answered.
 - `adversary` is left to M7.
+
+### Phase M7 (2026-10-22, machine 1)
+
+Done:
+- `[rag] adversary` (`"none"` by default; `tamper_text`, `inflate_score`, `fake_centroid`, `equivocate`) in `src/config.rs`. A node with a mode other than `"none"` logs `😈 [rag] adversary = …: this node will send corrupted answers to peers. EXPERIMENTS ONLY.` at startup.
+- `src/rag/adversary.rs` (new) holds the four corruptions as small functions, plus `RagService::misbehave`, which `protocol.rs` calls on every honest answer before sending it. Python and the asking side are unchanged.
+- `/rag/status` now shows a peer flagged `equivocation` as `asked_in_queries: false`, matching the queries that refuse it. Before this fix it showed `true`.
+- `cargo test --release`: 35 tests pass. 4 new tests feed each corruption, on fixture data, to the M6 checks: tampered chunks fail their proofs, inflated scores are flagged after rescoring, fake centroids fail their proofs, and a second root under one version is recorded as equivocation with both roots as evidence.
+
+Check: an honest node 1 (generator Ollama) and an adversarial node 2, in an isolated test federation (fresh scratch data, own ports, own federation id). Both nodes were restarted for each mode, so no flags carried over. The six `node2_only` questions were asked in two_round and flat mode:
+
+| Mode | node 2's `flags` | What happened to node 2's data | `FORGED` in contexts or answer |
+| :-- | :-- | :-- | :-- |
+| `tamper_text` | `bad_chunk_proof` | two_round: every chunk rejected (9, or 7 for q10, per question); flat: 5 of 5 rejected. No remote context. | never |
+| `inflate_score` | two_round: `score_mismatch`, `score_overclaim`; flat: `score_mismatch` | Chunks kept (they are genuine). Every remote context has `claimed_score − score = 0.300`; ranking used the recomputed scores. | never |
+| `fake_centroid` | two_round: `bad_centroid_proof`; flat: `bad_centroid_proof`, `bad_chunk_proof` | two_round: all 3 offered centroids failed, `selected_clusters = []`, no round 2 sent. Flat: entries failed, so all 5 chunks were rejected. | never |
+| `equivocate` | `equivocation` | The first q07 was answered normally (5 verified contexts, "Rameswaram"). The second `hello` returned a validly signed root `ae72ade3…` with the same version as the real `5172ade3…`, recorded as `equivocation` with 2 signed roots in `evidence`. The next q07: node 2 `refused`, not asked. | never |
+
+- Every attack was detected with the flag predicted in section 9, and no tampered text reached a context or an answer.
+- `score_overclaim` only exists in two_round, because flat mode has no round-1 claims. That is expected.
+- With node 2's chunks rejected or refused, the `node2_only` questions were answered from node 1's own chunks, and mostly wrongly: e.g. q07 "Allahabad", q08 "2008-2012". This is the same failure as the `scope: "local"` baseline in Phase 4. The scheme keeps forged text out; it cannot supply the missing evidence.
+- Flags other than `equivocation` are recorded but do not stop a peer being asked. Acting on them is the "trust scores" extension in section 12.
+
+Differences from the plan, and additions (logged in `docs/decisions.md`, J32–J36):
+- `tamper_text` writes the marker word `FORGED` in place of each chunk's middle word, so "no tampered text in the answer" can be checked by searching.
+- `fake_centroid` corrupts the cluster entries of every answer kind, not only round 1, so flat mode is attacked too.
+- `equivocate` signs the real root with its first byte flipped, under the same version. "Every other `hello`" counts all `hello`s this node answers, from any peer.
+- The `/rag/status` fix described above.
+- The live check ran in an isolated test federation with fresh data rather than with the `examples/rag-2node` configs.

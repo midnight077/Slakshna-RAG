@@ -231,8 +231,11 @@ impl RagProtocol {
             return response;
         }
 
+        let request_body = request.body.clone();
         match self.respond(request.body).await {
-            Ok((body, error)) => {
+            Ok((mut body, error)) => {
+                // Experiments only: corrupt the honest answer ([rag] adversary).
+                self.service.misbehave(&request_body, &mut body).await;
                 response.body = body;
                 response.error = error;
             }

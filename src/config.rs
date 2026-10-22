@@ -195,6 +195,24 @@ pub enum SelectBy {
     BestChunk,
 }
 
+/// A simulated misbehaving peer (`docs/merkle_tree.md`, section 9). For
+/// experiments only: the node answers peers honestly, then corrupts the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Adversary {
+    /// Honest (the default).
+    #[default]
+    None,
+    /// Change one word in every chunk sent to peers.
+    TamperText,
+    /// Add 0.3 to every chunk score and every claimed best chunk score.
+    InflateScore,
+    /// Replace every centroid sent with the query's embedding, to win round 1.
+    FakeCentroid,
+    /// On every other `hello`, sign a different root under the same version.
+    Equivocate,
+}
+
 /// Retrieval-augmented generation. Off unless `[rag] enabled = true`.
 ///
 /// The ML work is done by a local Python sidecar (`rag_engine.py`) that the
@@ -283,6 +301,9 @@ pub struct RagConfig {
     /// Drop peer chunks proven against a root first seen during the query itself.
     #[serde(default)]
     pub require_prior_root: bool,
+    /// EXPERIMENTS ONLY: make this node misbehave towards peers. "none" by default.
+    #[serde(default)]
+    pub adversary: Adversary,
 }
 
 fn default_sidecar_port() -> u16 { 8600 }
@@ -333,6 +354,7 @@ impl Default for RagConfig {
             score_tolerance: default_score_tolerance(),
             drop_unverified: true,
             require_prior_root: false,
+            adversary: Adversary::None,
         }
     }
 }

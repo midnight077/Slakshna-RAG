@@ -118,6 +118,12 @@ async fn main() -> Result<(), BoxError> {
             transport_key
         );
         service.refresh_own_root().await?;
+        if config.rag.adversary != crate::config::Adversary::None {
+            tracing::warn!(
+                "😈 [rag] adversary = {:?}: this node will send corrupted answers to peers. EXPERIMENTS ONLY.",
+                config.rag.adversary
+            );
+        }
         (Some(Arc::new(service)), child)
     } else {
         (None, None)

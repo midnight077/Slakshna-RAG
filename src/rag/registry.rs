@@ -217,7 +217,9 @@ impl RootRegistry {
                 PeerRootStatus {
                     endpoint_id: id.to_string(),
                     status,
-                    asked_in_queries: self.should_ask(id, now, stale),
+                    // Queries also refuse equivocating peers (retrieval.rs).
+                    asked_in_queries: self.should_ask(id, now, stale)
+                        && !entry.has_flag(FLAG_EQUIVOCATION),
                     version: entry.root.as_ref().map(|r| r.version),
                     root: entry
                         .root
@@ -402,6 +404,15 @@ mod tests {
         assert_eq!(failing.last_error.as_deref(), Some("timed out"));
 
         assert_eq!(line(untried).status, "untried");
+
+        // An equivocating peer is shown as not asked, as queries refuse it.
+        registry.add_flag(peer.public(), FLAG_EQUIVOCATION);
+        let lines = registry.status(&[], now, Duration::from_secs(180));
+        let refused = lines
+            .iter()
+            .find(|l| l.endpoint_id == peer.public().to_string())
+            .unwrap();
+        assert!(!refused.asked_in_queries);
         assert!(line(untried).asked_in_queries);
     }
 }
