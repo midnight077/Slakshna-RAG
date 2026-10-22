@@ -94,6 +94,12 @@ def create_app(store, generator):
         response["retrieve_ms"] = round((time.perf_counter() - started) * 1000, 1)
         return response
 
+    @app.get("/clusters")
+    def clusters():
+        # The whole centroid directory, for peers' directory mode.
+        with store.lock:
+            return {"root_version": store.version, "clusters": store.all_clusters()}
+
     @app.post("/centroids")
     def centroids(request: CentroidsRequest):
         q = embed_query(request.query)

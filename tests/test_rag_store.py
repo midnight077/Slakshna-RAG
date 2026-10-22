@@ -280,6 +280,18 @@ class ClusteredStoreTests(unittest.TestCase):
             self.store.search("mars", top_k=3, with_proofs=True)
         self.assertEqual(len(self.store.search("mars", top_k=3)), 3)
 
+    def test_all_clusters_is_the_complete_directory(self):
+        entries = self.store.all_clusters()
+        summary = self.store.commitment_summary()
+        self.assertEqual(len(entries), summary["num_clusters"])
+        self.assertEqual([e["cluster_id"] for e in entries], list(range(summary["num_clusters"])))
+        self.assertEqual(sum(e["size"] for e in entries), summary["num_chunks"])
+        for entry in entries:
+            self.assertNotIn("best_chunk_score", entry)
+            centroid = np.frombuffer(bytes.fromhex(entry["centroid"]), dtype="<f4")
+            start = cluster_hash(entry["cluster_id"], centroid, bytes.fromhex(entry["subtree_root"]))
+            self.assertEqual(fold_proof(start, entry["cluster_proof"]).hex(), summary["root"])
+
     def test_empty_store_has_zero_root(self):
         empty = VectorStore(os.path.join(self.tmp.name, "empty"), FakeEmbedder())
         summary = empty.commitment_summary()
@@ -287,6 +299,7 @@ class ClusteredStoreTests(unittest.TestCase):
         self.assertEqual((summary["version"], summary["num_clusters"], summary["num_chunks"]), (0, 0, 0))
         self.assertEqual(empty.nearest_centroids(self.query("moon"), 3), [])
         self.assertEqual(empty.search("moon", 3, with_proofs=True), {"chunks": [], "clusters": []})
+        self.assertEqual(empty.all_clusters(), [])
 
 
 class HnswIndexTests(unittest.TestCase):

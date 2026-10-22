@@ -280,6 +280,16 @@ class VectorStore:
             cluster_ids = sorted({chunk["cluster_id"] for chunk in results})
             return {"chunks": results, "clusters": [self.commitment.cluster_entry(c) for c in cluster_ids]}
 
+    def all_clusters(self):
+        """Every cluster entry of the current commitment, ids 0..k-1, in order.
+
+        This is the node's centroid directory (docs/merkle_tree.md, 15.2). Read
+        it under `self.lock` together with `self.version` so both match.
+        """
+        with self.lock:
+            self._require_committed()
+            return [self.commitment.cluster_entry(c) for c in range(self.commitment.num_clusters)]
+
     def nearest_centroids(self, query_vec, n):
         """The `n` cluster entries whose centroids are closest to `query_vec`, best first.
 

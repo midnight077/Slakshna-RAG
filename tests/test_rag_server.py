@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 warnings.filterwarnings("ignore", message=".*httpx.*")
 from fastapi.testclient import TestClient  # noqa: E402
 
+from rag.merkle import cluster_hash, fold_proof  # noqa: E402
 from rag.server import create_app  # noqa: E402
 from rag.store import VectorStore  # noqa: E402
 from test_rag_store import CLUSTER_DOCS, FakeEmbedder, verify_chunk  # noqa: E402
@@ -87,6 +88,17 @@ class SidecarRouteTests(unittest.TestCase):
         for chunk in result["chunks"]:
             self.assertIn(chunk["cluster_id"], (0, 1))
             self.assertTrue(verify_chunk(self.store, chunk, entries))
+
+    def test_clusters_returns_the_whole_directory(self):
+        result = self.client.get("/clusters").json()
+        self.assertEqual(result["root_version"], self.store.version)
+        self.assertEqual([e["cluster_id"] for e in result["clusters"]], [0, 1, 2])
+        self.assertEqual(result["clusters"], self.store.all_clusters())
+        root = self.store.commitment.root_hex
+        for entry in result["clusters"]:
+            centroid = np.frombuffer(bytes.fromhex(entry["centroid"]), dtype="<f4")
+            start = cluster_hash(entry["cluster_id"], centroid, bytes.fromhex(entry["subtree_root"]))
+            self.assertEqual(fold_proof(start, entry["cluster_proof"]).hex(), root)
 
     def test_search_clusters_rejects_stale_root_and_unknown_cluster(self):
         stale = self.post("/search_clusters", {"query": "mars", "root_version": self.store.version - 1,
