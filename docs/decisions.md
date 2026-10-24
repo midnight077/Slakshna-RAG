@@ -379,3 +379,92 @@ The three nodes kept the `examples/rag-2node` settings and corpora, but got thei
 
 **K20. A test loads every config under `examples/` (Claude, 2026-10-22).**
 *Why:* "existing configs still load" should be checked by a test that keeps running, not by hand once. It covers the 14 example configs, including the training-cluster ones.
+
+## L. M9: comparison with Flower FedRAG on the HPC
+
+**L0. M9 compares Slakshna-RAG with Flower's FedRAG example on MedRAG Textbooks split into 5 shards; questions are MIRAGE MedQA-US + MMLU-Med; everything runs on one CPU server (User, 2026-10-23).**
+The user chose the dataset, the 5-node target, the question sets (out of MedQA + MMLU-Med, all four sets, Flower's PubMedQA + BioASQ, or a small subset first) and confirmed the HPC is one 256-thread machine with no GPU and no scheduler. This replaces the open questions of D16 / plan 16.1.
+*Why:* Flower's FedRAG is the best-known federated RAG baseline and uses the same MedRAG corpora. The Textbooks corpus comes from the MedQA project, so MedQA and MMLU-Med are the questions it can actually help answer; PubMedQA and BioASQ are about research abstracts.
+
+**L1. Embedder `BAAI/bge-base-en-v1.5` for both systems; no MiniLM rerun (Claude recommended, User chose, 2026-10-23).**
+*Why:* clearly better retrieval than MiniLM at a cost CPU can still carry (768 numbers per vector, ~5× slower to embed). One embedder halves indexing and run time. It is used without a query instruction in both systems, so the comparison stays symmetric.
+
+**L2. One shared answering script for every system, using Flower's exact prompt and answer-extraction rule; both systems return contexts only (Claude, 2026-10-23).**
+Slakshna nodes run with `generator = "none"`; Flower's server is patched to save its merged documents instead of calling its LLM. `scripts/m9/answer.py` then answers every system's contexts the same way.
+*Why:* only retrieval should differ. Separating retrieval from answering also lets identical contexts be answered once (a cache), adds closed-book and global-index references for free, and keeps slow CPU answering out of the latency measurements. Check E0(a) proves the split doesn't change Flower's answers.
+
+**L3. Answering LLM: Ollama `qwen2.5:7b-instruct` on CPU, falling back to `qwen2.5:3b-instruct` if calibration projects more than about a day (Claude, 2026-10-23).**
+Temperature 0, seed 0, `num_predict 10`, `num_ctx 8192`.
+*Why:* a strong instruction model at multiple-choice medical questions, with no "thinking" mode that would break a 10-token answer limit, and it runs on any Ollama version. On CPU, reading a ~2.5k-token prompt dominates the cost, so the model size is set by measured speed. `num_ctx` must be raised because Ollama's default window silently cuts an 8-snippet prompt.
+
+**L4. Slakshna ingests the MedRAG snippets as given (one snippet = one chunk, id = MedRAG id, text = `content`) instead of re-chunking (Claude, 2026-10-23).**
+*Why:* both systems must search exactly the same pieces of text, and Flower uses MedRAG's snippets and their `content` field.
+
+**L5. Candidate budget matched at 40 for every system: `top_k = final_k = 8`, `max_clusters = 4`, `chunks_per_cluster = 8` (Claude, 2026-10-23).**
+Flower: 5 × 8. Slakshna flat: 8 local + 4 × 8. Two-round and directory: 8 local + 4 clusters × 8.
+*Why:* recall depends on how many candidates are gathered before cutting to 8, so the budget must match for the comparison to be about the method. Other budgets are explored in the optional simulation (E5).
+
+**L6. Flower is run as shipped, except for minimal patches that touch no retrieval logic (Claude, 2026-10-23).**
+Patches: the corpus folder from an environment variable; `retriever.yaml` set to bge-base; a copy of the server loop that saves contexts instead of calling the LLM; the run config. Its `IndexIVFFlat` with `nprobe = 1` and its per-query reload of the model and index stay as they are; one optional run (E2b) searches all buckets.
+*Why:* a baseline tuned by us would be open to the charge that we weakened or strengthened it. Keeping its real behaviour and showing the index effect separately is the honest option.
+
+**L7. `rag_engine.py ingest --vectors` loads pre-computed embeddings from the M9 cache (Claude, 2026-10-23).**
+Clustering, the Merkle tree and the HNSW index are still built by the normal store code; a spot check re-embeds 50 random snippets of every shard file (so 50–900 per node) and requires a difference under 1e-4. Measured on the laptop: ~1e-7.
+*Why:* embedding 125.8k snippets with bge-base on CPU takes about an hour each time, and the vectors would be identical. It is a tool change, so it is logged (plan 16.2 of D16 required that).
+
+**L8. New flag `iiitd --print-endpoint-id` (Claude, 2026-10-23).**
+*Why:* the config generator must list every other node's EndpointId in `peers` before any node starts, and that id only exists once the node's identity is created. Already planned in D16.
+
+**L9. M9 configs raise `select_timeout_ms` to 5000, `peer_timeout_ms` to 15000 and `max_message_bytes` to 4 MiB (Claude, 2026-10-23).**
+*Why:* with 25k chunks per node and 768-number vectors, a 64-cluster directory is ~450 KB of JSON and re-embedding up to 32 peer chunks on 16 CPU threads can take a second or two. The defaults were sized for the 2-node test corpus; spurious timeouts would make results depend on load rather than on the method.
+
+**L10. Flower runs on its Deployment Runtime (a SuperLink plus 5 SuperNode processes), not its simulation engine (Claude, 2026-10-23).**
+*Why:* Slakshna's 5 nodes are real processes talking over the network stack; Flower's simulation runs clients inside one Ray process, which would make latency incomparable.
+
+**L11. M9 raw outputs stay out of git; the aggregate CSVs, plots and an environment record are committed under `results/m9/summary/` (Claude, 2026-10-23).**
+*Why:* raw files (contexts for 2362 questions × many runs) are large runtime output (CLAUDE.md conventions), while the summary is what the write-up cites and must be reproducible from a known commit.
+
+**L12. Two shard schemes: `book` (whole books, greedy by size) and `random` (seed 1234) (Claude, 2026-10-23).**
+*Why:* `book` is how real owners would hold data (each holds whole subjects, non-IID) and is where cluster routing should help; `random` is the IID control. The Dirichlet scheme of D16 is dropped: with 18 books and 5 nodes, `book` already gives strong skew.
+
+**L13. Retrieval quality is recall@8 against an exact search over the whole corpus, matched by text hash (Claude, 2026-10-23).**
+*Why:* MIRAGE has gold answers but no gold passages. Flower returns text without ids, so snippets are matched by a hash of their text.
+
+**L14. Accuracy comparisons are paired: McNemar's exact test and a bootstrap 95% interval (Claude, 2026-10-23).**
+*Why:* every system answers the same questions, so a paired test is far more sensitive than comparing two percentages, and the interval says which differences are too small to claim.
+
+**L15. Answer accuracy runs on the `book` scheme first; `random` only if the calibration leaves time (Claude, 2026-10-23).**
+*Why:* CPU answering is the bottleneck (thousands of questions per context set), and recall@8 from E1 already covers both schemes.
+
+**L16. The untracked `scripts/run_mirage_slakshna.py` is superseded by `scripts/m9/run_slakshna.py` + `scripts/m9/answer.py` (Claude, 2026-10-23).**
+*Why:* it answered inline with Flower's LLM, saved no context text (so recall and caching were impossible), and targeted PubMedQA + BioASQ. Its core idea, Flower's own prompt applied to Slakshna's contexts, is kept in L2.
+
+**L17. Laptop tests use `BAAI/bge-small-en-v1.5` as a stand-in for bge-base, on a 2,000-snippet subset over 3 nodes (Claude, 2026-10-23).**
+*Why:* the laptop's disk is 98% full (about 2 GB free) and bge-small was already downloaded. It is the same model family (also normalised, 384 numbers), and every M9 script takes the model as an option, so the HPC runs use bge-base unchanged.
+
+**L18. Flower's processes keep all their state in `m9-flwr/`, each with its own `FLWR_HOME`; the SuperLink also gets `FEDRAG_CORPUS_DIR`; runtime dependency installation is off (Claude, 2026-10-23).**
+*Why:* a separate home leaves the user's `~/.flwr` alone and stops 5 SuperNodes on one machine from sharing one app folder. The ServerApp checks that the indexes exist before it starts, so it needs the corpus folder too (the first test run failed without it). Dependencies are already in `.venv-flower`; installing at run time would need network access and could change versions mid-experiment.
+
+**L19. The M9 Flower server waits until all N SuperNodes are online (Claude, 2026-10-23).**
+Flower's own `node_online_loop` returns as soon as one SuperNode is online.
+*Why:* a run started before all clients connect would silently search fewer shards, which would look like poor recall. Waiting changes nothing once all clients are there.
+
+**L20. A Flower run is judged by the lines it wrote, not by `flwr run`'s exit code (Claude, 2026-10-23).**
+*Why:* `flwr run --stream` exited 0 although the ServerApp had crashed (seen in testing). `flower_cluster.py run` fails when the run added no output.
+
+**L21. M9 node APIs listen on 127.0.0.1, and `allowed_peers` lists exactly the federation's nodes (Claude, 2026-10-23).**
+*Why:* the HPC is a shared machine on a LAN. The peer port always listens on every interface, so `allowed_peers` keeps other machines' nodes out, and the HTTP API, which has no authentication, stays local.
+
+**L22. The LLM calibration loads the model with one untimed request and gives each worker count different questions (Claude, 2026-10-23).**
+*Why:* the first test re-sent the same 6 prompts at each worker count, and Ollama answered the repeats from its prompt cache: 15.9 s per question with 1 worker, 0.37 s with 2. That would have badly under-estimated the run time.
+
+**L23. The cluster start/stop helpers are Python scripts (`scripts/m9/slakshna_cluster.py`, `scripts/m9/flower/flower_cluster.py`), not the shell scripts named in the plan (Claude, 2026-10-23).**
+*Why:* waiting for readiness means polling JSON (`/rag/status`, `flwr supernode list --format json`) and keeping process ids; that is simpler and more robust in Python, still standard library only.
+
+**L24. The M9 Flower server imports `merge_documents` and `node_online_loop` from Flower's `server_app.py` instead of copying them (Claude, 2026-10-23).**
+*Why:* importing guarantees the merge is Flower's code exactly. Only `submit_question` is re-written, to also record which shard each reply came from; it builds the same messages.
+
+**L25. Bytes per query are reported for both systems, with different scopes stated (Claude, 2026-10-23).**
+Slakshna: JSON payload of every peer request and response, proofs included (K12). Flower: the text of the returned documents plus 8 bytes per score, as recorded by the M9 server; Flower's message framing is not counted.
+*Why:* Flower doesn't expose its wire sizes, and its payload carries no proofs, so a single number would mislead. The write-up shows both with this caveat.
+

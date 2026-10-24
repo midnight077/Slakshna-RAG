@@ -1,6 +1,6 @@
 # Verifiable, Cluster-Routed Retrieval (Merkle Roots + K-Means) — Implementation Plan
 
-Written 2026-10-18. Status: **Phases M1–M8 done (M8, the centroid directory mode, on 2026-10-22, branch `centroid-directory`). M9 (evaluation of all three modes on the HPC with the user's dataset, section 16) not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
+Written 2026-10-18. Status: **Phases M1–M8 done (M8, the centroid directory mode, on 2026-10-22, branch `centroid-directory`). M9 (comparison with Flower FedRAG on the HPC, all three modes, MedRAG Textbooks on 5 nodes) planned 2026-10-23 in section 16; scripts built and tested locally (M9a–M9d), HPC runs not started.** Results per phase are in section 14. Builds on the working P2P RAG pipeline from `docs/p2p_rag_plan.md` (Phases 0–4 done). Read that plan first; this one changes its peer protocol.
 
 ## 0. Summary in plain language
 
@@ -431,8 +431,8 @@ Each phase ends with a check. Don't start a phase until the previous check passe
 ### Phase M8 — Centroid directory mode
 - Full design, steps and check in **section 15**.
 
-### Phase M9 — Evaluation of all three modes on the HPC (feeds Phases 5–6 of `p2p_rag_plan.md`)
-- Full plan in **section 16**. It replaces the old M8 ("evaluation"), adds `directory` as a third mode, and runs on the user's dataset and HPC.
+### Phase M9 — Slakshna-RAG vs Flower FedRAG on the HPC (feeds Phases 5–6 of `p2p_rag_plan.md`)
+- Full plan in **section 16** (rewritten 2026-10-23). All three modes against Flower's FedRAG example, on MedRAG Textbooks split over 5 nodes on one CPU server, with MedQA + MMLU-Med questions and one shared answering LLM.
 
 ## 9. Simulated adversaries (`[rag] adversary`, experiments only)
 
@@ -503,6 +503,9 @@ New files in `docs/` need `git add -f` (`.gitignore` ignores `/docs`).
 - [x] Phase M7 — simulated adversaries (done 2026-10-22; see section 14)
 - [x] Phase M8 — centroid directory mode (done 2026-10-22; design in section 15, results in section 14)
 - [ ] Phase M9 — evaluation of all three modes on the HPC (section 16)
+  - [x] Plan revised with the user's answers: Textbooks on 5 nodes, MedQA + MMLU-Med, bge-base, Flower FedRAG as the baseline (2026-10-23)
+  - [x] M9a data preparation  - [x] M9b Slakshna tooling  - [x] M9c Flower harness  - [x] M9d answering and evaluation (built and tested on the laptop 2026-10-23; see the M9 entry in section 14)
+  - [ ] M9e HPC runs E0–E4  - [ ] M9f simulation (optional)  - [ ] M9g write-up
 
 ## 14. Results
 
@@ -817,6 +820,42 @@ Differences from the plan, and additions (logged in `docs/decisions.md`, K12–K
 - The live check ran in an isolated test federation with fresh data and no pinned machine-2 peer, rather than with `examples/rag-2node` as is.
 - A test loads every example config.
 
+### Phase M9, steps M9a–M9d (2026-10-23, laptop) — scripts built and tested locally
+
+The HPC runs (M9e) have not started; these are pipeline checks on a small subset, not results.
+
+Built (decisions L17–L25 cover what changed from the plan):
+- `iiitd --print-endpoint-id`; MedRAG `.jsonl` ingest and `ingest --vectors` (`rag/vector_cache.py`); `SLAKSHNA_TORCH_THREADS`. 7 new Python tests (58 in all pass); Rust 50 pass, as before.
+- `scripts/m9/`: `prepare_textbooks.py`, `embed_cache.py`, `global_baseline.py`, `slakshna_cluster.py`, `run_slakshna.py`, `answer.py`, `evaluate.py`, `m9_common.py`; `scripts/rag_make_configs.py`; `scripts/m9/flower/`: `setup_flower.sh`, `patch_fedrag.py`, `m9_server_app.py`, `build_indexes.sh`, `flower_cluster.py`.
+
+Full dataset preparation, run once on the laptop and then deleted (disk nearly full): 125,847 snippets (83 repeat an earlier text). `book`: node 0 holds Harrison alone (32,628), the others 23,236–23,429 each; `random`: 25,169–25,170 each. MedQA 1273 + MMLU-Med 1089 = 2362 questions.
+
+Test set-up (L17): 4 books × 500 snippets over 3 nodes (`book`: 1000/500/500), `bge-small-en-v1.5`, the fixed 20-question subset, `qwen2.5:1.5b` for answers.
+
+| Check | Outcome |
+| :-- | :-- |
+| `--vectors` spot check | 50 per file, max difference 1.2–1.5e-7 (limit 1e-4) |
+| 3 nodes ready (roots and complete directories) | 15 s after start |
+| E0(b): Slakshna flat vs exact global top 8 | recall@8 = 1.00 |
+| E0(c): `scope: "local"` | all 8 contexts from shard 0 on every question |
+| Prompt copy vs Flower's `LLMQuerier` | byte-identical on all 2362 questions, with and without documents; answer rule identical on edge cases |
+| E0(a), part 1: Flower's server answering inline vs `answer.py --backend hf` on its saved contexts (SmolLM2-135M, 6 questions) | 6/6 identical |
+| E0(a), part 2: Flower's untouched server, same 6 questions | printed MedQA 2 answered, 0.0; MMLU 2 answered, 0.5; `evaluate.py` gives the same |
+
+Retrieval on the 20 questions (indicative only; 3 nodes, so the candidate budgets of L5 don't match yet, and the laptop was also running the LLM):
+
+| System | recall@8 | median time per question | median bytes |
+| :-- | --: | --: | --: |
+| Flower (stock `nprobe = 1`) | 0.65 | 9.1 s | 21.6 KB (text only, L25) |
+| Slakshna flat | 1.00 | 0.85 s | 48.8 KB |
+| Slakshna two_round | 0.89 | 1.80 s | 86.4 KB |
+| Slakshna directory | 0.90 | 1.74 s | 61.9 KB |
+| Slakshna local only (node 0) | 0.38 | 0.03 s | 0 |
+
+Seen along the way:
+- Slakshna's time is mostly `rescore` (re-embedding peers' chunks to check their scores): ~1.6 s of 1.7 s in directory mode on 4 threads. Flower's is mostly reloading the embedding model on every query.
+- Fixed during testing: the SuperLink also needs `FEDRAG_CORPUS_DIR` (L18); `flwr run` exits 0 when the ServerApp crashes (L20); the first calibration was fooled by Ollama's prompt cache (L22).
+
 ## 15. Phase M8 — Centroid directory mode (design)
 
 Planned 2026-10-22. Decisions D11–D15 (section 1) and K1–K9 in `docs/decisions.md`.
@@ -969,133 +1008,266 @@ Steps, in order. Run the unit tests after each:
    - (f) **Re-ingest:** ingest one document on node 2 through `/rag/ingest`. A query before node 1's next refresh shows the stale-root case from 15.3 step 6 (or, if the refresh already ran, a fresh directory at the new version). The next query after a refresh uses the new version. `/rag/status` shows the new `root_version` for node 2's directory.
 4. **Adversaries** in an isolated test federation (J36), directory mode: `fake_centroid` and `hide_cluster` detected as predicted in 15.4; `tamper_text`, `inflate_score` and `equivocate` detected as in M7; `FORGED` never appears in a context or answer.
 
-## 16. Phase M9 — Evaluation of all three modes on the HPC (plan)
+## 16. Phase M9 — Slakshna-RAG vs Flower FedRAG on the HPC (plan)
 
-Planned 2026-10-22 (D16). This also covers Phases 5 (4/6/8 nodes) and 6 (evaluation) of `p2p_rag_plan.md`. Start only after M8 is done. The questions in 16.1 must be answered first, because several steps depend on them.
+First drafted 2026-10-22 (D16). Rewritten 2026-10-23 after the user's answers (16.1): M9 is now a head-to-head comparison with Flower's FedRAG example on 5 nodes, on one CPU machine. It still covers Phases 5 and 6 of `p2p_rag_plan.md`. Decisions are L1–L16 in `docs/decisions.md`.
 
-### 16.1 Inputs needed before starting (ask the user and record the answers here)
+### 16.1 Inputs (answered by the user, 2026-10-23)
 
-**Dataset**
-- Name, source and licence.
-- Format (PDF / text / JSON).
-- Number of documents and total size.
-- Language.
-- Are there **questions** with **gold answers**, and with **gold supporting documents or passages**? Recall needs gold passages or a single-index baseline. Answer accuracy needs gold answers.
-- Is there a natural split across "owners" (e.g. per institution or per topic) that should define the nodes?
+**Dataset: MedRAG Textbooks** (`huggingface.co/datasets/MedRAG/textbooks`, from the MedQA project; the dataset card states no licence, so it's used for research only and not redistributed).
+- 18 medical textbooks, already cut into **~125.8k snippets** (~211 MB of JSONL). Each line is `{"id": "Anatomy_Gray_0", "title": "Anatomy_Gray", "content": "...", "contents": "<title>. <content>"}`. Flower embeds `content`; so will we.
+- The books differ a lot in size: Harrison's Internal Medicine alone is 25% of the text, Surgery 14%, Pathoma under 1%.
+- **Shard into 5 parts** (one per node). Two schemes, 16.3.
 
-**HPC**
-- Scheduler (SLURM?).
-- Number of compute nodes available, and cores, RAM and GPU per node.
-- Job time limits.
-- Shared filesystem.
-- Container support (Apptainer / Singularity).
-- Internet access from compute nodes, for Hugging Face models, pip, cargo.
-- Can processes on **different compute nodes** reach each other over **UDP** (Iroh/QUIC needs it)? Which port ranges?
-- Is there a login node where builds run, and is it the same architecture as the compute nodes?
+**Questions: MIRAGE MedQA-US (1273) + MMLU-Med (1089) = 2362**, four options A–D each, with a gold answer letter. There are **no gold passages**, so retrieval quality is measured against an exact search over the whole corpus (16.5).
+
+**Machine:** one server, `iiitd` (192.168.3.143). 2 × AMD EPYC 7763 (128 cores, 256 threads), 503 GB RAM, 11 TB free disk, Ubuntu 20.04. **No GPU and no job scheduler.** System Python is 3.8 (too old: we use `uv` to get 3.11). Rust and Ollama are installed. Internet works (two of three probes returned 200; which one returned 403 is checked in step 0 of 16.8).
+- Consequence: all 5 Slakshna nodes, all 5 Flower clients and the LLM share this one machine. Runs that measure latency never overlap with each other or with LLM answering.
+- No scheduler means long runs go inside `tmux`, so they survive a dropped SSH connection.
 
 **Models**
-- Embedding model. Keep MiniLM (comparable with M1–M8) or use a stronger one? It must be the same on every node. A larger `dim` affects message sizes (15.2) and the fixture-free parts only.
-- Generator for answer quality. Ollama may not be allowed on the HPC. The options are vLLM or `llama.cpp` behind the same Ollama-style API, or `generator = "none"` for retrieval-only metrics.
+- Embedder: **`BAAI/bge-base-en-v1.5`** for both systems (768 numbers per vector; L1). No MiniLM rerun (user's choice).
+- Answering LLM: **Ollama `qwen2.5:7b-instruct`**, CPU, temperature 0. If the calibration in 16.8 step 8 shows the full answer run would take more than about a day, switch to `qwen2.5:3b-instruct` (L3).
 
-**Scale**
-- Target node counts for the live runs, e.g. 2, 4, 8, 16, 32, 64. The 1000-node point is covered by the offline simulation (16.3).
+**Scale:** 5 nodes. Larger counts only in the optional offline simulation (16.6, E5).
 
-### 16.2 Preparation
+### 16.2 What "fair" means here
 
-1. **`scripts/rag_prepare_dataset.py`** converts the dataset into:
-   - `datasets/<name>/docs/`
-   - `datasets/<name>/questions.jsonl`: `{id, question, answers: [...], gold_doc_ids: [...], gold_passages?: [...]}`
-   - `datasets/<name>/partitions/<scheme>-N<n>/node{i}/` for each partition scheme and node count. Use symlinks or copies, whichever the shared filesystem prefers.
+Only retrieval may differ between the two systems. Everything else is held the same:
 
-   Partition schemes, with the seed recorded:
-   - **`random`**: documents spread evenly at random (IID);
-   - **`topic`**: k-means on document embeddings, so each node holds mostly one topic (non-IID, closest to real federations);
-   - **`dirichlet`**: topic mixture per node drawn from Dirichlet(α), with α ∈ {0.1, 1.0}.
-2. **Embedding cache.** Embed every chunk **once** (GPU if available) and save `embeddings.npy` plus `chunks.jsonl` per dataset. The simulation (16.3) uses this cache directly.
-   - Live nodes ingest normally. Optionally, add a `rag_engine.py ingest --vectors` path that loads cached vectors to save time. That is a tool change, so log it as a decision if done.
-3. **Single-index baseline:** one index over the whole corpus, giving the "ideal" top-k for every question.
-4. **`scripts/rag_make_configs.py`** (planned in `p2p_rag_plan.md` Phase 5, not yet written). It writes N node configs with:
-   - unique ports, `data_dir`, `sidecar_port` and `corpus_dir`;
-   - the same `federation.id`;
-   - `[discovery]` all off (no mDNS, DHT, DNS or relay);
-   - `training.enabled = false`, `directory = true`;
-   - `network.peers` listing **every other node** as `<EndpointId>@<host>:<p2p_port>`. This sidesteps gossip's small neighbour view (section 12), so `peer_targets` = N−1.
+| Held equal | How |
+| :-- | :-- |
+| Snippets on each node | Both read the same shard files (16.3). Slakshna ingests MedRAG snippets as they are, one snippet = one chunk, without re-chunking (L4). |
+| Embedder | `bge-base-en-v1.5` in both; Flower via its `retriever.yaml`. Its vectors come out unit-length, so Flower's L2 distance ranks the same as our cosine. |
+| Candidates gathered | Flower: 5 clients × 8 = **40**, merged to 8. Slakshna flat: 8 local + 4 peers × 8 = **40** → 8. Two-round and directory: 8 local + `max_clusters = 4` × `chunks_per_cluster = 8` = **40** → 8 (L5). |
+| Final context | 8 snippets (`k-nn = 8` / `final_k = 8`). |
+| LLM, prompt, answer extraction | One shared answering script (16.4) for every system: Flower's exact prompt text and its "first letter A–D" rule, the same model and settings (L2). |
+| Machine load | Same thread limits per node; one system running at a time. |
 
-   Each EndpointId is only known after a node creates its identity. So add `iiitd --config X --print-endpoint-id`: create or load the identity in `data_dir`, print the EndpointId, and exit. This is a small `main.rs` change; log it as a decision. The config script runs it for every node first, then writes the `peers` lists.
-5. **HPC job scripts** in `scripts/hpc/`:
-   - `build.sh` (cargo build, Python venv);
-   - `rag_cluster.sbatch` (place N RAG nodes on M compute nodes, several per compute node, wait until every node's `/rag/status` shows N−1 `peer_targets` with `status: "ok"`, run the question set, collect logs and results, stop everything);
-   - one generator server per compute node, if answers are generated.
-6. **`scripts/rag_eval.py`** turns the saved JSONL responses (`rag_run_questions.py` output) into per-question rows and aggregate tables (CSV) and plots.
+What deliberately stays **as Flower ships it** (L6): its FAISS `IndexIVFFlat` index searching 1 of ~158 buckets (`nprobe = 1`), and its client reloading the embedding model and index on every query. These are Flower's real behaviour, so they're part of the comparison. One optional extra run (E2b) sets `nprobe` to all buckets, to separate "Flower's index is approximate" from "Flower's design".
 
-### 16.3 Experiment A — offline routing simulation (1000 nodes, no networking)
+Differences that are the point of the comparison, and are reported, not removed:
+- Flower has a central server; Slakshna has none (node 1 asks, and also holds shard 0).
+- Slakshna checks a Merkle proof for every peer chunk and re-embeds peers' chunks to recompute scores. That costs time and bytes, which are measured.
 
-`scripts/rag_sim_routing.py` is pure Python. It reuses `rag/clustering.py` so clusters are built exactly as in the store, and it reads the embedding cache. For each partition scheme and N ∈ {10, 100, 1000}, and each question:
-- **global**: top `final_k` from the single index (the reference);
-- **flat**: each node's top `top_k`, merged to `final_k`;
-- **two_round**: each node offers its top `centroids_per_peer` centroids; global `select_clusters` (same rule as Rust); `chunks_per_cluster` from each winner; merged to `final_k`;
-- **directory**: every centroid of every node is a candidate; same selection and round 2.
+### 16.3 Data preparation
 
-Metrics per question:
-- **recall@final_k** against the global top `final_k`;
-- **gold recall**: whether any gold passage or document is in the contexts, if gold exists;
-- **peers contacted** (round 1 + round 2);
-- **estimated bytes**, from the measured message sizes of M8 (bytes per centroid entry, per chunk);
-- for directory mode, **directory size per node**.
+`scripts/m9/prepare_textbooks.py` (new) downloads the 18 JSONL files and MIRAGE's `benchmark.json` into `datasets/textbooks/` (already ignored by git through `/data*`) and writes:
+- `questions.jsonl`: `{id, dataset, question, options, answer}` for MedQA and MMLU-Med, in MIRAGE's sorted order (the order Flower iterates).
+- `partitions/<scheme>/node{0..4}/*.jsonl`, in MedRAG format, for two schemes:
+  - **`book`** (non-IID, closest to real owners): whole books per node, greedy by snippet count (biggest book first, each to the node holding the fewest snippets so far). Deterministic. Harrison will end up nearly alone on one node.
+  - **`random`** (IID): every snippet dealt to a node at random, seed 1234, equal sizes.
+  - In `random`, a book is split across nodes, so each shard file is renamed `<Book>__s<i>.jsonl` with ids `<Book>__s<i>_<n>`. Flower finds a snippet's text by parsing its id as "file name + line number", so ids must match line numbers in the shard file. The original id is kept as `orig_id`.
+- `flower/<scheme>/textbooks_s<i>/chunk/` symlinks to the same files, the layout Flower's retriever expects.
+- `stats.json`: snippets and characters per node per scheme, and the seed.
 
-Sweeps:
-- `n_clusters` ∈ {auto, 4, 8, 16, 32, 64};
-- `max_clusters` ∈ {1, 3, 5, 10};
-- `min_centroid_score` ∈ {0, 0.1, 0.2, 0.3};
-- `centroids_per_peer` ∈ {1, 3, 5} (two_round);
-- `select_by` (two_round).
+`scripts/m9/embed_cache.py` (new) embeds all snippets **once** with all cores (`embeddings.npy` + `ids.json`). `scripts/m9/global_baseline.py` (new) runs an **exact** search (`IndexFlatIP`) over the whole corpus and writes the top 8 per question as a contexts file (16.4). This is the "one central index" reference.
 
-This is where "does centroid routing still find the right chunks at 1000 nodes" is answered.
+Slakshna can also ingest straight from this cache (`rag_engine.py ingest --vectors`, L7), so the 125.8k snippets aren't embedded on CPU three more times (~40–60 min each). Clustering, the Merkle tree and the HNSW index are still built by the normal store code. A spot check re-embeds 50 random snippets of every shard file and requires a max difference under 1e-4. Flower builds its own index with its own code.
 
-Check: a small run (N = 2, the M6 corpus) reproduces the clusters selected in the live M8 run for the same questions. This shows the simulation matches the real code.
+### 16.4 Code to write
 
-### 16.4 Experiment B — live federation on the HPC
+**Slakshna side**
+1. `rag/loaders.py`, `rag/store.py`, `rag_engine.py`: ingest pre-chunked MedRAG JSONL (one line → one chunk, `chunk_id` = the MedRAG id, `text` = `content`), and `--vectors <cache>`. Python tests for both.
+2. `rag/embedder.py`: thread count from `SLAKSHNA_TORCH_THREADS`, so 5 sidecars don't each grab all 256 threads.
+3. `iiitd --config X --print-endpoint-id` (`src/main.rs`): create or load the identity, print the EndpointId, exit (planned in D16; L8).
+4. `scripts/rag_make_configs.py`: N node configs on one host. Same `federation.id` per scheme; unique ports, `data_dir` and `sidecar_port`; discovery all off; `peers` = every other node as `<EndpointId>@127.0.0.1:<port>`; `training.enabled = false`; `generator = "none"`; `directory = true`; `top_k = final_k = 8`; `max_clusters = 4`; `chunks_per_cluster = 8`; `max_message_bytes = 4 MiB` (a 64-cluster × 768-dim directory is ~450 KB of JSON); `select_timeout_ms = 5000` and `peer_timeout_ms = 15000` (re-embedding 32 chunks with bge-base on 16 threads can take a second or two; L9). No `corpus_dir`: nodes are ingested before they start.
+5. `scripts/m9/slakshna_cluster.py up|wait|down`: start the nodes in the background (logs in `<configs>/logs/`, torch threads per sidecar), and wait until **every** node's `/rag/status` shows the other nodes as peer targets with `status: "ok"` and complete directories.
+6. `scripts/m9/run_slakshna.py`: ask node 1 every question in one mode and save one JSONL line per question: question id, the 8 contexts (text, node, chunk id, score, verification), `timings_ms`, per-peer status, bytes and `selected_via`, and the wall time. No LLM. It replaces the untracked `scripts/run_mirage_slakshna.py`, which mixed retrieval and answering in one step and saved no context text.
 
-For N in the agreed list, for each partition scheme (at least `random` and `topic`), run every question in `flat`, `two_round` and `directory`, plus `scope: "local"` on one node, and compare with the single-index baseline.
+**Flower side** (`scripts/m9/flower/`)
+7. `setup_flower.sh`: clone `flwrlabs/flower` at a pinned commit, copy out `examples/fedrag`, apply `fedrag.patch`, install into `.venv-flower`. The patch (L6):
+   - `retriever.py`: corpus folder from `FEDRAG_CORPUS_DIR` (needed because the Deployment Runtime runs the app from an installed copy, not from the example folder); optional `FEDRAG_NPROBE` for E2b. Search logic unchanged.
+   - `retriever.yaml`: `bge-base-en-v1.5`, 768.
+   - new `fedrag/m9_server_app.py`: Flower's own `server_app.py` main loop and `merge_documents`, unchanged, except that instead of calling the LLM it writes each question's merged 8 documents, every client's returned documents and scores, each reply's payload size, and the wall time to a JSONL file. `client_app.py` is untouched.
+   - `pyproject.toml`: corpus names `textbooks_s0|…|textbooks_s4`, `k-nn = 8`, `k-rrf = 60`, datasets `medqa|mmlu`, all questions.
+8. `build_indexes.sh --scheme <scheme>`: call Flower's own `Retriever().build_faiss_index` for each shard, several shards at once if asked.
+9. `flower_cluster.py up|run|down`: `flower-superlink --insecure` plus 5 `flower-supernode` processes on their own ports (Flower's Deployment Runtime: real separate processes talking HTTP, like our 5 nodes; L10). All Flower state, logs and the `[superlink.m9]` connection live in `m9-flwr/`, not in `~/.flwr` (L18). `run` submits the app with `flwr run --stream` and checks that the run wrote output, because `flwr run` exits 0 even when the ServerApp crashes.
 
-Record per query:
-- contexts with origin and verification;
-- answer, if a generator is used;
-- `timings_ms` (select, fetch, rescore, generate);
-- per peer: status, `selected_via`, `round1_ms`, `round2_ms`, bytes, flags.
+**Shared**
+10. `scripts/m9/answer.py`: reads any contexts file (Slakshna, Flower, global, or none for closed-book) and writes one prediction per question.
+    - Prompt and extraction copied from Flower's `llm_querier.py` (Apache-2.0, credited in the file).
+    - Backend `ollama` (default): `/api/chat`, temperature 0, `seed 0`, `num_predict 10` (Flower's `max_new_tokens`), **`num_ctx 8192`**. Ollama's default context window would silently cut an 8-snippet prompt (~2.5k tokens).
+    - Backend `hf`: Flower's own `LLMQuerier`, used only for the check in E0.
+    - Caches answers by hash of (model, prompt), so identical contexts from two systems cost one LLM call. Resumable. Spreads work over several Ollama instances.
+11. `scripts/m9/evaluate.py`: joins contexts, predictions and gold answers and writes CSV tables and plots (16.7).
 
-Also record per run:
-- directory memory and fetch bytes;
-- `hello` and `directory` refresh traffic per minute;
-- CPU time per node, if the scheduler reports it.
+### 16.5 Metrics
 
-Run each configuration at least 3 times, to report the spread of latency.
+Per question and system:
+- **Accuracy**, both ways: over all questions (an unparsable answer counts as wrong), and Flower's way (unanswered questions left out). The unanswered count is also reported.
+- **recall@8**: share of the exact global top 8 found in the system's 8 contexts. Snippets are matched by a hash of their text, since Flower returns text without ids.
+- **Overlap with Flower's contexts**, and which nodes the contexts came from.
+- **Latency**: wall time per question, plus Slakshna's breakdown (`select`, `fetch`, `rescore`) and Flower's server-side wall time.
+- **Bytes per query**: Slakshna's measured JSON payload bytes (K12); Flower's reply payload size (documents + scores), recorded by the patched server. Neither includes transport overhead.
+- **Peers contacted** per query (round 1 + round 2), and directory size per node.
 
-### 16.5 Experiment C — adversaries at scale
+Comparisons between two systems are **paired** (same questions): McNemar's exact test on right/wrong, and a bootstrap 95% interval for the accuracy difference. With 2362 questions the interval is about ±2 points, so smaller differences are reported as "no measurable difference".
 
-On one N (e.g. 16), in all three modes, make a fraction f ∈ {10%, 30%} of the nodes adversarial: one mode per run, `tamper_text`, `inflate_score`, `fake_centroid`, `hide_cluster`, `equivocate`.
+### 16.6 Experiments
 
-Measure:
-- the share of adversarial peers flagged (expected 100% for every mode that is detectable by design);
-- `FORGED` in any context or answer (expected 0);
-- the loss of recall and answer accuracy compared with f = 0. Rejected honest-looking data is lost evidence; see M7's results.
+| ID | What | Needs LLM | Runs |
+| :-- | :-- | :-- | :-- |
+| **E0** | Sanity checks | partly | (a) Stock Flower (with its own LLM, SmolLM2-1.7B via `transformers`) on the first 20 MedQA questions, `book` scheme. `answer.py --backend hf` on the contexts our patched Flower server saved for the same 20 must give identical letters. This shows the harness doesn't change Flower's results. (b) Slakshna flat vs the global exact top 8: recall@8 ≥ 0.95 expected (HNSW search is near-exact at this size). (c) Slakshna `scope: "local"` on node 1 equals node 1's own top 8. |
+| **E1** | Retrieval, both schemes | no | Global; Flower; Slakshna flat, two_round, directory; Slakshna local (node 1 only). All 2362 questions once per system and scheme, for recall, bytes and peers contacted. |
+| **E2** | Latency | no | A fixed 200-question subset, 3 repeats per system and scheme, after one warm-up pass, for median and p95. (b, optional) Flower with `nprobe` = all buckets. |
+| **E3** | Answer accuracy | yes | `book` scheme: closed-book (no context), global, Flower, Slakshna flat / two_round / directory / local. `random` scheme as well if the calibration says time allows. |
+| **E4** | Attacks | subset | `book` scheme, 1 of 5 nodes attacking (20%; one attack per run: `tamper_text`, `inflate_score`, `fake_centroid`, `hide_cluster`, `equivocate`), all three modes, the 200-question subset. Measure: attacker flagged (expected 100%), `FORGED` in contexts (expected 0), recall lost vs no attack. (Optional) The same `tamper_text` / `inflate_score` against Flower, through an environment switch in one Flower client, to show what happens without verification. |
+| **E5** | Offline routing simulation (optional, after E1–E4; K11) | no | `scripts/rag_sim_routing.py`, pure Python: the embedding cache split into N ∈ {5, 10, 100, 1000} shards, clusters built with `rag/clustering.py`, and each mode's selection replayed with the same rule as Rust. Per question: recall@8 vs global, peers contacted, estimated bytes (from E1's measured sizes), directory size. Sweeps: `n_clusters` ∈ {auto, 16, 32, 64}, `max_clusters` ∈ {1, 2, 4, 8}, `chunks_per_cluster` ∈ {3, 8}, `centroids_per_peer` ∈ {1, 3, 5}. The N = 5 point must reproduce E1's selected clusters exactly; anything about more than 5 nodes is labelled simulated. |
 
-### 16.6 Outputs
+Expected results, as hypotheses to test, not claims: Slakshna flat ≈ global; Flower's recall below global because of `nprobe = 1`; two_round and directory a little below flat; Flower slower per query because it reloads its model each time; Slakshna paying extra for proofs and rescoring.
 
-- `results/m9/<experiment>/…` raw JSONL and CSV. Runtime output: keep it out of git, or commit only the small aggregate CSVs. Decide when starting.
-- Tables and plots, all against N:
-  - recall@k;
-  - answer accuracy;
-  - median and p95 latency, with breakdown;
-  - bytes per query;
-  - peers contacted per query;
-  - directory size;
-  - detection rate.
+### 16.7 Outputs
+
+- Raw files in `results/m9/raw/` (not committed; L11): contexts, responses, predictions, logs.
+- Committed: `results/m9/summary/*.csv` and plots: accuracy, recall@8, latency (median and p95, with breakdown), bytes per query, peers contacted, directory size, detection rate, per system × scheme. Plus `results/m9/summary/env.txt`: commit hashes (ours and Flower's), `flwr`, Ollama and model versions, thread settings.
 - A "Phase M9" entry in section 14 with the headline numbers, and section 11's limits restated next to them.
-- Tick Phases 5 and 6 in `p2p_rag_plan.md` with a pointer here.
+- Phases 5 and 6 ticked in `p2p_rag_plan.md`, with a pointer here.
 
-### 16.7 Check
+### 16.8 Step-by-step on the HPC
 
-- Every table in 16.6 is filled for the agreed N values.
-- The simulation reproduces the live clusters selected at N = 2 (16.3).
-- Any claim about 1000 nodes is labelled as coming from the simulation, not from live runs.
+Run everything from the repository root, inside `tmux` (the server has no scheduler, so a dropped SSH connection must not kill a run). Every run script can be re-run with the same `--out`: it skips what is already saved. Names: the config name **is** the scheme name (`book`, `random`), so Slakshna's and Flower's rows match in the evaluation.
+
+Ports used (check they're free in step 0): Slakshna 9100–9104/UDP, 18545–18549, 18600–18604, 18645–18649; Flower 18000 and 18094–18098; Ollama 11500.
+
+**0. Once: access and tools**
+```bash
+ssh nishit@192.168.3.143
+tmux new -s m9                                   # later: tmux attach -t m9
+for u in https://huggingface.co https://pypi.org https://github.com https://index.crates.io; do echo "$u $(curl -s -o /dev/null -w '%{http_code}' $u)"; done
+command -v uv || curl -LsSf https://astral.sh/uv/install.sh | sh   # then open a new shell
+git clone <repo url> slakshna && cd slakshna && git checkout m9-flower-eval
+ss -lntu | grep -E ':(910[0-4]|1854[5-9]|1860[0-4]|1864[5-9]|18000|1809[4-8]|11500)\b' || echo "ports free"
+```
+
+**1. Build and install** (~10 min)
+```bash
+cargo build --release
+uv venv .venv-rag --python 3.11
+uv pip install --python .venv-rag/bin/python --torch-backend cpu -r requirements-rag.txt matplotlib
+```
+
+**2. Data** (~1–1.5 h, mostly the embedding)
+```bash
+.venv-rag/bin/python scripts/m9/prepare_textbooks.py --out datasets/textbooks
+.venv-rag/bin/python scripts/m9/embed_cache.py --data datasets/textbooks --threads 120
+.venv-rag/bin/python scripts/m9/global_baseline.py --data datasets/textbooks --out results/m9/raw/global.jsonl
+```
+Expect 125,847 snippets; `book`: 32,628 on node 0 (Harrison alone) and ~23,300 on each other node; `random`: ~25,170 each.
+
+**3. Flower set-up and the prompt check**
+```bash
+bash scripts/m9/flower/setup_flower.sh --data datasets/textbooks
+.venv-flower/bin/python scripts/m9/answer.py --data datasets/textbooks --contexts results/m9/raw/global.jsonl \
+    --check-prompt flower-fedrag-m9           # must say: prompt identical to Flower's on all 2362 rows
+```
+
+**4. Slakshna, `book` scheme** (E1, E2)
+```bash
+python3 scripts/rag_make_configs.py --nodes 5 --name book --out m9-configs/book --data-root m9-data/book
+for i in 0 1 2 3 4; do
+  SLAKSHNA_TORCH_THREADS=16 .venv-rag/bin/python rag_engine.py ingest --data-dir m9-data/book/node$i \
+    --embedding-model BAAI/bge-base-en-v1.5 --path datasets/textbooks/partitions/book/node$i \
+    --vectors datasets/textbooks/embeddings/BAAI__bge-base-en-v1.5 &
+done; wait                                        # each prints "... spot-checked, max difference ..."
+python3 scripts/m9/slakshna_cluster.py up --configs m9-configs/book --threads 16
+for mode in flat two_round directory; do
+  python3 scripts/m9/run_slakshna.py --configs m9-configs/book --data datasets/textbooks --retrieval $mode \
+    --out results/m9/raw/book/slakshna_$mode.jsonl
+done
+python3 scripts/m9/run_slakshna.py --configs m9-configs/book --data datasets/textbooks --scope local \
+    --out results/m9/raw/book/slakshna_local.jsonl
+for mode in flat two_round directory; do              # E2 latency
+  python3 scripts/m9/run_slakshna.py --configs m9-configs/book --data datasets/textbooks --retrieval $mode \
+    --qids datasets/textbooks/subset_200.json --warmup 20 --repeat 3 --out results/m9/raw/book/latency/slakshna_$mode.jsonl
+done
+python3 scripts/m9/slakshna_cluster.py down --configs m9-configs/book
+```
+
+**5. Attacks, `book` scheme** (E4; node 4 attacks, one attack per run)
+```bash
+for attack in tamper_text inflate_score fake_centroid hide_cluster equivocate; do
+  python3 scripts/rag_make_configs.py --nodes 5 --name book --out m9-configs/book --data-root m9-data/book \
+    --adversary $attack --adversary-node 4
+  python3 scripts/m9/slakshna_cluster.py up --configs m9-configs/book --threads 16
+  for mode in flat two_round directory; do
+    python3 scripts/m9/run_slakshna.py --configs m9-configs/book --data datasets/textbooks --retrieval $mode \
+      --qids datasets/textbooks/subset_200.json --out results/m9/raw/book/attack_$attack/slakshna_$mode.jsonl
+  done
+  python3 scripts/m9/slakshna_cluster.py down --configs m9-configs/book
+done
+python3 scripts/rag_make_configs.py --nodes 5 --name book --out m9-configs/book --data-root m9-data/book   # honest again
+```
+
+**6. Flower, `book` scheme** (E1, E2, E2b, E0(a))
+```bash
+bash scripts/m9/flower/build_indexes.sh --data datasets/textbooks --scheme book --jobs 5 --threads 24   # ~1 h
+python3 scripts/m9/flower/flower_cluster.py up --data datasets/textbooks --scheme book --threads 16
+python3 scripts/m9/flower/flower_cluster.py run --data datasets/textbooks --scheme book \
+    --out results/m9/raw/book/flower.jsonl
+python3 scripts/m9/flower/flower_cluster.py run --data datasets/textbooks --scheme book \
+    --qids datasets/textbooks/subset_200.json --warmup 20 --repeat 3 --out results/m9/raw/book/latency/flower.jsonl
+# E0(a): Flower's own LLM inline on the first 10 questions per set, then the same through answer.py
+python3 scripts/m9/flower/flower_cluster.py run --data datasets/textbooks --scheme book --qa-num 10 --llm \
+    --system flower_llm --out results/m9/raw/e0/flower_llm.jsonl
+.venv-flower/bin/python scripts/m9/answer.py --data datasets/textbooks --contexts results/m9/raw/e0/flower_llm.jsonl \
+    --backend hf --model HuggingFaceTB/SmolLM2-1.7B-Instruct
+python3 scripts/m9/flower/flower_cluster.py run --data datasets/textbooks --scheme book --variant stock --qa-num 10
+#   ^ Flower's untouched server prints "Accuracy" per dataset: compare with e0a.csv / accuracy.csv after step 9
+python3 scripts/m9/flower/flower_cluster.py down
+# E2b: the same clients searching every IVF bucket (exact search)
+python3 scripts/m9/flower/flower_cluster.py up --data datasets/textbooks --scheme book --threads 16 --nprobe all
+python3 scripts/m9/flower/flower_cluster.py run --data datasets/textbooks --scheme book --system flower_exact \
+    --qids datasets/textbooks/subset_200.json --out results/m9/raw/book/flower_exact.jsonl
+python3 scripts/m9/flower/flower_cluster.py down
+```
+
+**7. `random` scheme:** steps 4 and 6 again with `random` in place of `book` (no attacks, no E0(a), no E2b).
+
+**8. Ollama: calibrate, then answer** (E3)
+```bash
+mkdir -p logs && OLLAMA_HOST=127.0.0.1:11500 OLLAMA_NUM_PARALLEL=4 OLLAMA_MODELS=$HOME/ollama-models \
+  nohup ollama serve > logs/ollama-m9.log 2>&1 &
+OLLAMA_HOST=127.0.0.1:11500 ollama pull qwen2.5:7b-instruct
+python3 scripts/m9/answer.py --data datasets/textbooks --contexts results/m9/raw/global.jsonl \
+    --model qwen2.5:7b-instruct --url http://127.0.0.1:11500 --calibrate --limit 20 --calibrate-workers 1,2,4
+```
+The calibration prints seconds per question and hours per 2362 questions for each worker count. The `book` set needs about 7 such passes (closed-book, global, Flower, 3 modes, local) minus cached repeats. If that comes to more than about a day, pull `qwen2.5:3b-instruct` and use it instead (L3). Optionally try two instances, one per CPU socket (`numactl --cpunodebind=0 --membind=0 ollama serve` on 11500 and `--cpunodebind=1 --membind=1` on 11501), passing both with `--url ... --url ...`.
+```bash
+M=qwen2.5:7b-instruct; U=http://127.0.0.1:11500
+python3 scripts/m9/answer.py --data datasets/textbooks --closed-book --model $M --url $U --workers 4 \
+    --out results/m9/raw/closed_book.pred.${M//:/_}.jsonl
+for f in results/m9/raw/global.jsonl results/m9/raw/book/*.jsonl; do
+  case $f in *.pred.*) continue ;; esac
+  python3 scripts/m9/answer.py --data datasets/textbooks --contexts $f --model $M --url $U --workers 4
+done
+# if time allows: the same loop over results/m9/raw/random/*.jsonl
+```
+
+**9. Evaluate and bring the results back**
+```bash
+.venv-rag/bin/python scripts/m9/evaluate.py --data datasets/textbooks --raw results/m9/raw \
+    --global results/m9/raw/global.jsonl --out results/m9/summary
+# on the laptop:
+rsync -av nishit@192.168.3.143:slakshna/results/m9/summary/ results/m9/summary/
+```
+Before reporting any number, check: `e0a.csv` shows 100% agreement and the stock server printed the same accuracy (E0(a)); `slakshna_flat` has recall@8 ≥ 0.95 (E0(b)); `slakshna_local` contexts all come from shard 0 (E0(c)); no prediction file has `truncated` > 0.
+
+Rough machine time: data ~1.5 h; Flower indexes ~1 h per scheme; Slakshna ingest a few minutes per scheme; retrieval ~2362 questions × 5 systems per scheme at 1–5 s each, plus latency and attack runs (several hours per scheme); LLM answering is set by step 8's calibration.
+
+### 16.9 Implementation phases
+
+- **M9a** — data preparation, embedding cache, global baseline (16.3). Check: shard statistics; the global top 8 of a few questions read by hand.
+- **M9b** — Slakshna tooling (16.4 items 1–6). Check: Python and Rust tests; 5 local nodes on a 2,000-snippet subset, all three modes, E0(b) and E0(c).
+- **M9c** — Flower harness (items 7–9). Check: the 2,000-snippet subset through the Deployment Runtime; E0(a) with a small LLM.
+- **M9d** — `answer.py` and `evaluate.py` (items 10–11). Check: end to end on the laptop with 20 questions and `qwen2.5:0.5b`.
+- **M9e** — HPC runs E0–E4 (16.8).
+- **M9f** — optional E5 simulation.
+- **M9g** — results in section 14, `docs/explanation_merkle_tree.md` and `p2p_rag_plan.md`.
+
+### 16.10 Check
+
+- E0 (a), (b) and (c) pass before any number is reported.
+- Every table in 16.7 is filled for both schemes (accuracy at least for `book`).
+- Every result file records the commit hashes and model versions it came from.
+- Claims about more than 5 nodes are labelled as simulated (E5).

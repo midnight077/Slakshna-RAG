@@ -1,8 +1,9 @@
-"""Read source documents into plain text."""
+"""Read source documents into plain text, or pre-cut snippets from JSONL."""
 
+import json
 import os
 
-SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md")
+SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".jsonl")
 
 
 def load_document(path):
@@ -17,6 +18,26 @@ def load_document(path):
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
     raise ValueError(f"unsupported document type: {path}")
+
+
+def load_snippets(path):
+    """Return the `(chunk_id, text)` pairs of a JSONL file of pre-cut snippets.
+
+    Each line is a MedRAG snippet: `{"id", "title", "content", ...}`. The text
+    is `content`, as Flower's FedRAG embeds it. `orig_id`, when present, is the
+    id the snippet had before a shard file renamed it (scripts/m9), and wins.
+    """
+    snippets = []
+    with open(path, "r", encoding="utf-8") as f:
+        for number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            try:
+                snippets.append((str(row.get("orig_id") or row["id"]), row["content"]))
+            except KeyError as e:
+                raise ValueError(f"{path}:{number}: snippet has no {e} field") from e
+    return snippets
 
 
 def list_documents(path):

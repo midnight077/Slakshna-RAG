@@ -1,0 +1,35 @@
+=== OS / CPU / memory (login node) ===
+Linux iiitd 5.4.0-216-generic #236-Ubuntu SMP Fri Apr 11 19:53:21 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+NAME="Ubuntu"
+VERSION="20.04.6 LTS (Focal Fossa)"
+ID=ubuntu
+Architecture:                       x86_64
+CPU(s):                             256
+Thread(s) per core:                 2
+Socket(s):                          2
+Model name:                         AMD EPYC 7763 64-Core Processor
+              total        used        free      shared  buff/cache   available
+Mem:          503Gi       4.1Gi       366Gi        58Mi       133Gi       496Gi
+Swap:         8.0Gi          0B       8.0Gi
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda2        13T  1.4T   11T  12% /
+=== Scheduler ===
+=== GPUs ===
+no GPU on login node
+=== Modules / software ===
+/usr/bin/python3
+/home/nishit/.cargo/bin/cargo
+/home/nishit/.cargo/bin/rustc
+/usr/bin/clang
+/usr/bin/cmake
+/usr/local/bin/ollama
+Python 3.8.10
+=== Internet access (login node) ===
+HTTP/2 200
+HTTP/2 200
+HTTP/2 403
+=== Network ===
+lo               UNKNOWN        127.0.0.1/8 ::1/128
+eno1np0          UP             192.168.3.143/22 2001:df0:6000:0:da5e:d3ff:fe87:ddb9/64 fe80::da5e:d3ff:fe87:ddb9/64
+eno2np1          DOWN
+32768   60999

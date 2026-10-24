@@ -26,7 +26,7 @@ import numpy as np
 
 from .chunking import chunk_text
 from .clustering import choose_k, cluster
-from .loaders import list_documents, load_document
+from .loaders import list_documents, load_document, load_snippets
 from .merkle import Commitment
 
 # HNSW settings. M: graph neighbours per vector. efConstruction: candidates
@@ -47,12 +47,17 @@ def new_index(dim):
 
 
 class VectorStore:
-    def __init__(self, directory, embedder, n_clusters=0):
-        """`n_clusters` is the number of k-means clusters; 0 picks it from the corpus size."""
+    def __init__(self, directory, embedder, n_clusters=0, vector_cache=None):
+        """`n_clusters` is the number of k-means clusters; 0 picks it from the corpus size.
+
+        `vector_cache` (a `VectorCache`) supplies pre-computed vectors for
+        snippets ingested with `add_snippets`, instead of embedding them again.
+        """
         choose_k(0, n_clusters)  # rejects an out-of-range setting early
         self.directory = directory
         self.embedder = embedder
         self.n_clusters = n_clusters
+        self.vector_cache = vector_cache
         self.index = new_index(embedder.dim)
         self.vectors = np.zeros((0, embedder.dim), dtype=np.float32)
         self.chunks = []
@@ -175,22 +180,51 @@ class VectorStore:
         """
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         with self.lock:
-            known = self.documents.get(source)
-            if known == digest:
+            if self._already_ingested(source, digest):
                 return 0
-            if known is not None:
-                raise ValueError(f"document '{source}' is already ingested with different content; "
-                                 "delete the index directory and ingest again to replace it")
             pieces = chunk_text(text)
-            if not pieces:
+            ids = [f"{source}#{i}" for i in range(len(pieces))]
+            return self._append(source, digest, ids, pieces, self.embedder.embed(pieces) if pieces else None)
+
+    def add_snippets(self, source, snippets):
+        """Append chunks that were cut beforehand, one per `(chunk_id, text)` pair.
+
+        Used for corpora that ship already chunked, such as MedRAG's JSONL
+        snippets, so every system compared on them searches the same pieces.
+        Vectors come from `self.vector_cache` when one is set. Same skip and
+        reject rules as `add_document`; nothing is committed.
+        """
+        snippets = list(snippets)
+        digest = hashlib.sha256(json.dumps(snippets, ensure_ascii=False).encode("utf-8")).hexdigest()
+        with self.lock:
+            if self._already_ingested(source, digest):
                 return 0
-            vectors = self.embedder.embed(pieces)
-            self.index.add(vectors)
-            self.vectors = np.vstack([self.vectors, vectors])
-            for i, piece in enumerate(pieces):
-                self.chunks.append({"chunk_id": f"{source}#{i}", "source": source, "text": piece})
-            self.documents[source] = digest
-            return len(pieces)
+            ids = [chunk_id for chunk_id, _ in snippets]
+            texts = [text for _, text in snippets]
+            vectors = None
+            if snippets:
+                if self.vector_cache is not None:
+                    vectors = self.vector_cache.vectors_for(ids, texts, self.embedder)
+                else:
+                    vectors = self.embedder.embed(texts)
+            return self._append(source, digest, ids, texts, vectors)
+
+    def _already_ingested(self, source, digest):
+        known = self.documents.get(source)
+        if known is not None and known != digest:
+            raise ValueError(f"document '{source}' is already ingested with different content; "
+                             "delete the index directory and ingest again to replace it")
+        return known == digest
+
+    def _append(self, source, digest, chunk_ids, texts, vectors):
+        if not texts:
+            return 0
+        self.index.add(vectors)
+        self.vectors = np.vstack([self.vectors, vectors])
+        for chunk_id, text in zip(chunk_ids, texts):
+            self.chunks.append({"chunk_id": chunk_id, "source": source, "text": text})
+        self.documents[source] = digest
+        return len(texts)
 
     def commit(self):
         """Re-cluster every chunk, rebuild the Merkle tree, bump the version and save.
@@ -215,24 +249,39 @@ class VectorStore:
 
     def add_documents(self, documents):
         """Add `(source, text)` pairs, then commit once if anything was added."""
+        return self._add_all(lambda: self.add_document(source, text) for source, text in documents)
+
+    def add_path(self, path):
+        """Ingest a file, or every supported file under a directory.
+
+        `.jsonl` files hold pre-cut snippets (see `load_snippets`); the rest
+        are chunked here.
+        """
+        files = list_documents(path)
+        if not files:
+            raise ValueError(f"no PDF, .txt, .md or .jsonl files found at {path}")
+
+        def adder(f):
+            source = os.path.basename(f)
+            if f.lower().endswith(".jsonl"):
+                return lambda: self.add_snippets(source, load_snippets(f))
+            return lambda: self.add_document(source, load_document(f))
+
+        return self._add_all(adder(f) for f in files)
+
+    def _add_all(self, adds):
+        """Run each add, then commit once if anything was added."""
         with self.lock:
             added = 0
             try:
-                for source, text in documents:
-                    added += self.add_document(source, text)
+                for add in adds:
+                    added += add()
             finally:
                 # Commit what was added even if a later document failed, so the
                 # in-memory index and the files on disk stay the same.
                 if added:
                     self.commit()
             return added
-
-    def add_path(self, path):
-        """Ingest a file, or every supported file under a directory."""
-        files = list_documents(path)
-        if not files:
-            raise ValueError(f"no PDF, .txt or .md files found at {path}")
-        return self.add_documents((os.path.basename(f), load_document(f)) for f in files)
 
     def _require_committed(self):
         if self.commitment.num_chunks != len(self.chunks):

@@ -19,6 +19,7 @@ from rag.chunking import chunk_text
 from rag.clustering import choose_k
 from rag.merkle import ZERO_HASH, cluster_hash, fold_proof, leaf_hash
 from rag.store import HNSW_EF_SEARCH, VectorStore
+from rag.vector_cache import VectorCache
 
 KEYWORDS = ["moon", "mars", "rhino", "river"]
 
@@ -338,6 +339,107 @@ class HnswIndexTests(unittest.TestCase):
         self.assertEqual([c["chunk_id"] for c in rebuilt.search("rhino", top_k=3)], expected)
         # The rebuilt index was saved, so the next load needs no rebuild.
         self.assertIsInstance(faiss.read_index(os.path.join(self.tmp.name, "index.faiss")), faiss.IndexHNSWFlat)
+
+
+def write_snippets(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+SNIPPETS = [
+    {"id": "Book_0", "title": "Book", "content": "The moon orbits the earth.", "contents": "Book. The moon..."},
+    {"id": "Book_1", "title": "Book", "content": "A rhino by the river."},
+    {"id": "Book__s2_0", "orig_id": "Book_2", "title": "Book", "content": "Mars is red."},
+]
+
+
+class SnippetIngestTests(unittest.TestCase):
+    """Pre-cut MedRAG snippets (scripts/m9): one line is one chunk, not re-chunked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.corpus = os.path.join(self.tmp.name, "corpus")
+        os.makedirs(self.corpus)
+        write_snippets(os.path.join(self.corpus, "Book.jsonl"), SNIPPETS)
+        with open(os.path.join(self.corpus, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("river notes")
+        self.index_dir = os.path.join(self.tmp.name, "index")
+
+    def test_snippets_become_chunks_as_given(self):
+        store = VectorStore(self.index_dir, FakeEmbedder())
+        self.assertEqual(store.add_path(self.corpus), 4)
+
+        by_id = {chunk["chunk_id"]: chunk for chunk in store.chunks}
+        self.assertEqual(set(by_id), {"Book_0", "Book_1", "Book_2", "notes.txt#0"})
+        self.assertEqual(by_id["Book_0"]["text"], "The moon orbits the earth.")  # `content`, not `contents`
+        self.assertEqual(by_id["Book_2"]["source"], "Book.jsonl")
+        self.assertEqual(store.search("rhino", top_k=1)[0]["chunk_id"], "Book_1")
+        self.assertEqual(store.commitment.num_chunks, 4)
+
+    def test_snippets_survive_reload_and_reingest_is_a_no_op(self):
+        VectorStore(self.index_dir, FakeEmbedder()).add_path(self.corpus)
+        reloaded = VectorStore(self.index_dir, FakeEmbedder())
+
+        self.assertEqual(reloaded.num_chunks, 4)
+        self.assertEqual(reloaded.add_path(self.corpus), 0)
+
+    def test_changed_snippet_file_is_rejected(self):
+        store = VectorStore(self.index_dir, FakeEmbedder())
+        store.add_path(self.corpus)
+        write_snippets(os.path.join(self.corpus, "Book.jsonl"), SNIPPETS[:2])
+        with self.assertRaises(ValueError):
+            store.add_path(self.corpus)
+
+    def test_snippet_without_content_is_rejected(self):
+        write_snippets(os.path.join(self.corpus, "Bad.jsonl"), [{"id": "Bad_0", "text": "no content field"}])
+        with self.assertRaises(ValueError):
+            VectorStore(self.index_dir, FakeEmbedder()).add_path(self.corpus)
+
+
+class VectorCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.corpus = os.path.join(self.tmp.name, "corpus")
+        os.makedirs(self.corpus)
+        write_snippets(os.path.join(self.corpus, "Book.jsonl"), SNIPPETS)
+        self.cache = os.path.join(self.tmp.name, "cache")
+
+    def write_cache(self, ids, texts, model_name=FakeEmbedder.model_name, shift=0.0):
+        os.makedirs(self.cache, exist_ok=True)
+        vectors = FakeEmbedder().embed(texts) + np.float32(shift)
+        np.save(os.path.join(self.cache, "vectors.npy"), vectors.astype(np.float32))
+        with open(os.path.join(self.cache, "ids.json"), "w") as f:
+            json.dump(ids, f)
+        with open(os.path.join(self.cache, "meta.json"), "w") as f:
+            json.dump({"embedding_model": model_name, "dim": FakeEmbedder.dim, "count": len(ids)}, f)
+
+    def test_cached_vectors_are_used_and_missing_ones_embedded(self):
+        # Book_1 is not in the cache, so it must be embedded on the spot.
+        self.write_cache(["Book_2", "Book_0"], ["Mars is red.", "The moon orbits the earth."])
+        cache = VectorCache(self.cache)
+        store = VectorStore(os.path.join(self.tmp.name, "index"), FakeEmbedder(), vector_cache=cache)
+        store.add_path(self.corpus)
+
+        expected = FakeEmbedder().embed([row["content"] for row in SNIPPETS])
+        np.testing.assert_allclose(store.vectors, expected, atol=1e-6)
+        self.assertEqual(cache.checked, 2)
+
+    def test_cache_from_other_text_is_refused(self):
+        self.write_cache(["Book_0", "Book_1", "Book_2"], ["mars", "moon", "rhino"])
+        store = VectorStore(os.path.join(self.tmp.name, "index"), FakeEmbedder(), vector_cache=VectorCache(self.cache))
+        with self.assertRaises(ValueError):
+            store.add_path(self.corpus)
+        self.assertEqual(store.num_chunks, 0)
+
+    def test_cache_from_other_model_is_refused(self):
+        texts = [row["content"] for row in SNIPPETS]
+        self.write_cache(["Book_0", "Book_1", "Book_2"], texts, model_name="other-model")
+        store = VectorStore(os.path.join(self.tmp.name, "index"), FakeEmbedder(), vector_cache=VectorCache(self.cache))
+        with self.assertRaises(ValueError):
+            store.add_path(self.corpus)
 
 
 if __name__ == "__main__":

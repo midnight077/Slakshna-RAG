@@ -52,6 +52,16 @@ curl localhost:8545/rag/query -H 'content-type: application/json' -d '{"query": 
 curl localhost:8545/rag/debug/hello           # fetch every peer's signed RAG root and check its signature
 python3 scripts/rag_run_questions.py --api http://localhost:8545 --retrieval two_round --out /tmp/two_round.jsonl   # all 15 questions, full responses saved
 ./start_cluster.sh 2                         # 2, 4 or 6 local nodes from examples/<N>node/, logs in logs/
+
+# M9: Slakshna vs Flower FedRAG (full HPC runbook: docs/merkle_tree.md, section 16.8)
+./target/release/iiitd --config X --print-endpoint-id                  # create/load the identity, print the EndpointId, exit
+.venv-rag/bin/python scripts/m9/prepare_textbooks.py --out datasets/textbooks   # download + shard MedRAG Textbooks, MIRAGE questions
+python3 scripts/rag_make_configs.py --nodes 5 --name book --out m9-configs/book --data-root m9-data/book
+python3 scripts/m9/slakshna_cluster.py up --configs m9-configs/book    # start N nodes, wait until all see each other; also wait/down
+python3 scripts/m9/run_slakshna.py --configs m9-configs/book --data datasets/textbooks --retrieval flat --out results/m9/raw/book/slakshna_flat.jsonl
+bash scripts/m9/flower/setup_flower.sh --data datasets/textbooks       # pinned Flower FedRAG copy + .venv-flower
+python3 scripts/m9/flower/flower_cluster.py up|run|down ...            # Flower SuperLink + SuperNodes
+python3 scripts/m9/answer.py ... / .venv-rag/bin/python scripts/m9/evaluate.py ...   # shared LLM answers, tables
 ./stop_cluster.sh
 ```
 
@@ -114,6 +124,7 @@ The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running loc
 - **Wire format.** Renaming `RecordKind` or `P2PMessage` variants or fields breaks compatibility; every node in a federation must run the same build.
 - **Hardcoded paths.** `node_template.yaml` points at `/mnt/disk1/slakshna/...`; `setup.sh` rewrites that prefix inside `ml_engine.py` with `sed`, which shows up as a diff in a tracked file.
 - **`.gitignore` ignores `/docs`, all dotfiles and `Cargo.lock`.** The tracked files under those were force-added; new files in `docs/` need `git add -f`.
+- **`.jsonl` files are ingested as pre-cut snippets** (MedRAG format, one line = one chunk, `content` is the text), not chunked again. Any other stray `.jsonl` in a corpus folder makes ingest fail.
 - **The training loop runs unless `[training] enabled = false`.** It defaults to on and needs a GPU-class machine plus the Bhaskera environment. The RAG configs in `examples/rag-2node/` turn it off.
 
 ## Leftovers from an earlier project

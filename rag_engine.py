@@ -1,6 +1,7 @@
 """RAG sidecar for a SLAKSHNA node.
 
     python rag_engine.py ingest --data-dir ./data-rag-node1 --path corpus/node1
+    python rag_engine.py ingest --data-dir ./node --path shard/ --vectors cache/   # pre-embedded snippets
     python rag_engine.py serve  --data-dir ./data-rag-node1 --port 8600
 
 The index lives in <data-dir>/rag/. `serve` listens on 127.0.0.1 only.
@@ -18,10 +19,13 @@ from rag import DEFAULT_EMBEDDING_MODEL
 def open_store(args):
     from rag.embedder import Embedder
     from rag.store import VectorStore
+    from rag.vector_cache import VectorCache
 
     print(f"Loading embedding model {args.embedding_model}...", file=sys.stderr)
     embedder = Embedder(args.embedding_model)
-    return VectorStore(os.path.join(args.data_dir, "rag"), embedder, n_clusters=args.n_clusters)
+    cache = VectorCache(args.vectors) if getattr(args, "vectors", None) else None
+    return VectorStore(os.path.join(args.data_dir, "rag"), embedder, n_clusters=args.n_clusters,
+                       vector_cache=cache)
 
 
 def describe_commitment(store):
@@ -35,6 +39,9 @@ def cmd_ingest(args):
     added = store.add_path(args.path)
     print(f"Added {added} chunks; index now holds {store.num_chunks} chunks "
           f"from {len(store.documents)} documents in {describe_commitment(store)}.", file=sys.stderr)
+    if store.vector_cache is not None:
+        print(f"Vectors from cache {args.vectors}; {store.vector_cache.checked} spot-checked, "
+              f"max difference {store.vector_cache.max_difference:.1e}.", file=sys.stderr)
 
 
 def exit_when_parent_dies():
@@ -79,7 +86,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     ingest = sub.add_parser("ingest", parents=[common], help="add documents to the index")
-    ingest.add_argument("--path", required=True, help="a PDF/.txt/.md file, or a directory of them")
+    ingest.add_argument("--path", required=True,
+                        help="a PDF/.txt/.md file, a .jsonl file of pre-cut snippets, or a directory of them")
+    ingest.add_argument("--vectors", help="directory of pre-computed snippet vectors (scripts/m9/embed_cache.py)")
     ingest.set_defaults(func=cmd_ingest)
 
     serve = sub.add_parser("serve", parents=[common], help="run the local HTTP service")

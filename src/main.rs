@@ -54,6 +54,17 @@ async fn main() -> Result<(), BoxError> {
     // Load config
     let mut config = Config::load(&config_path)?;
 
+    // `--print-endpoint-id`: create or load this node's identity, print its
+    // Iroh EndpointId (what other nodes list in `network.peers`) and exit.
+    // Used by scripts/rag_make_configs.py before any node starts.
+    if args.iter().any(|arg| arg == "--print-endpoint-id") {
+        let mut state = State::new(&config.node.data_dir)?;
+        state.get_or_create_node_identity()?;
+        let keypair = state.get_keypair().ok_or("node identity not loaded")?;
+        println!("{}", keypair.transport_secret_key().public());
+        return Ok(());
+    }
+
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::new(format!("{},iroh=error", config.logging.level.as_str()));
