@@ -3,7 +3,7 @@
     .venv-rag/bin/python scripts/m9/global_baseline.py --data datasets/textbooks \
         --out results/m9/raw/global.jsonl
 
-For every question, the top `k` snippets by cosine similarity (exact
+For every question, the top `k` distinct snippet texts by cosine similarity (exact
 `IndexFlatIP` over the cached vectors, query embedded with the same model).
 This is what a single central index would return, the target recall@k is
 measured against (docs/merkle_tree.md, 16.5). The query is the question text
@@ -19,7 +19,7 @@ import faiss
 import numpy as np
 
 from m9_common import (DEFAULT_MODEL, ROOT, context_record, load_questions, log, model_slug,
-                       read_jsonl, write_jsonl)
+                       read_jsonl, text_hash, write_jsonl)
 
 sys.path.insert(0, ROOT)
 
@@ -48,9 +48,18 @@ def main():
     rows = []
     for question in questions:
         started = time.time()
-        scores, found = index.search(embedder.embed([question["question"]]), args.k)
-        contexts = [{"text": corpus[i]["content"], "id": corpus[i]["id"], "node": None, "score": float(s)}
-                    for s, i in zip(scores[0], found[0]) if i >= 0]
+        # Some snippets repeat another's text exactly; both systems keep such
+        # text once when merging, so the reference does too: the top k
+        # distinct texts, searched with room to skip repeats.
+        scores, found = index.search(embedder.embed([question["question"]]), 4 * args.k)
+        contexts, seen = [], set()
+        for s, i in zip(scores[0], found[0]):
+            if i < 0 or text_hash(corpus[i]["content"]) in seen:
+                continue
+            seen.add(text_hash(corpus[i]["content"]))
+            contexts.append({"text": corpus[i]["content"], "id": corpus[i]["id"], "node": None, "score": float(s)})
+            if len(contexts) == args.k:
+                break
         rows.append(context_record("global", None, 1, question, contexts, time.time() - started,
                                    {"model": args.model}))
     write_jsonl(args.out, rows)

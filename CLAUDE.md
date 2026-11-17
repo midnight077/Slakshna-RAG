@@ -123,13 +123,20 @@ The RAG sidecar (`rag_engine.py`, package `rag/`) is a separate long-running loc
 - **`allowed_peers` filters on `delivered_from`**, the neighbour that forwarded a gossip message, not its original author.
 - **Wire format.** Renaming `RecordKind` or `P2PMessage` variants or fields breaks compatibility; every node in a federation must run the same build.
 - **Hardcoded paths.** `node_template.yaml` points at `/mnt/disk1/slakshna/...`; `setup.sh` rewrites that prefix inside `ml_engine.py` with `sed`, which shows up as a diff in a tracked file.
-- **`.gitignore` ignores `/docs`, all dotfiles and `Cargo.lock`.** The tracked files under those were force-added; new files in `docs/` need `git add -f`.
+- **`.gitignore` ignores `/docs`, all dotfiles and `CLAUDE.md`.** On the `RAG` branch (see "Where work happens" below) never `git add -f` anything under `docs/`; the only tracked files there are the original repo's own.
 - **`.jsonl` files are ingested as pre-cut snippets** (MedRAG format, one line = one chunk, `content` is the text), not chunked again. Any other stray `.jsonl` in a corpus folder makes ingest fail.
 - **The training loop runs unless `[training] enabled = false`.** It defaults to on and needs a GPU-class machine plus the Bhaskera environment. The RAG configs in `examples/rag-2node/` turn it off.
 
 ## Leftovers from an earlier project
 
 `scripts/benchmark*.py`, `scripts/test_shield_*.py`, `scripts/test_dcp.py`, `deploy.sh`, `Dockerfile` and `docker-compose.yml` reference endpoints and files that no longer exist (transaction nonces, a `config.toml`, an nginx directory). Treat them as stale unless the user says otherwise. `iroh-blobs`, `rayon` and several other dependencies in `Cargo.toml` are not used by `src/`.
+
+## Where work happens
+
+- All work happens on the **`RAG` branch**, which is pushed to the team repository (`upstream` = `dcll-iiitd/Slakshna`, also `origin` = the user's `Slakshna-RAG` as a backup). The older branches in `Slakshna-RAG` (`m9-flower-eval` and earlier) are an archive with unrelated history; don't commit to them or merge them into `RAG`.
+- On `RAG`, **never commit `docs/` notes (`decisions.md`, `merkle_tree.md`, `explanation*.md`, `p2p_rag_plan.md`, `paper_rag_section.md`, `presentation_plan.md`, `hpc_info.txt`), `CLAUDE.md`, `Unified_Slakshna.pdf` or `presentation/`.** They are the user's local notes. Keep editing them as this file asks, but leave them out of every `git add`, and check `git status` before committing. The team-facing documentation is `README.md`.
+- Code comments must not point to `docs/` files or decision ids (such as "L27"), because those don't exist in the team repository. Point to code, tests or the README instead.
+- To read a file as it was on an archived branch, use `git show m9-flower-eval:<path>` rather than checking that branch out.
 
 ## Conventions
 
@@ -147,6 +154,8 @@ Whenever you choose between real alternatives (a design, a library, a default va
 - when a decision changes, mark the old entry **Replaced** with a pointer to the new one instead of deleting it.
 
 Routine edits that follow an existing decision need no entry.
+
+`docs/decisions.md` is a local note: update it, but never commit it on `RAG`.
 
 ## Working with the user
 

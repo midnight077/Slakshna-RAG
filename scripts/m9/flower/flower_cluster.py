@@ -91,6 +91,10 @@ def up(args):
     time.sleep(3)
     for i in range(args.nodes):
         env = dict(base, FLWR_HOME=os.path.join(STATE, f"supernode{i}"), FEDRAG_CORPUS_DIR=corpus_dir)
+        # Flower's client loads the embedder on every query; online, each load also
+        # asks huggingface.co about the model, which can be rate-limited (L27). The
+        # model is already cached by build_indexes.sh, so the clients stay offline.
+        env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
         if args.threads:
             env.update(OMP_NUM_THREADS=str(args.threads), MKL_NUM_THREADS=str(args.threads))
         if args.nprobe:

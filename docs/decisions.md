@@ -468,3 +468,25 @@ Flower's own `node_online_loop` returns as soon as one SuperNode is online.
 Slakshna: JSON payload of every peer request and response, proofs included (K12). Flower: the text of the returned documents plus 8 bytes per score, as recorded by the M9 server; Flower's message framing is not counted.
 *Why:* Flower doesn't expose its wire sizes, and its payload carries no proofs, so a single number would mislead. The write-up shows both with this caveat.
 
+
+**L26. The global reference keeps the top 8 *distinct* texts (Claude, 2026-10-25).**
+83 MedRAG snippets repeat another snippet's text exactly. Slakshna's merge and Flower's fusion both keep identical text once, but the first reference did not. So when a repeated pair ranked in its top 8, it held only 7 distinct texts, and even the reference scored recall 0.9992 against itself on the first HPC run. `global_baseline.py` now searches 32 and keeps the first 8 distinct texts.
+*Why:* recall must compare like with like; a reference no system can reach exactly would bias every recall number slightly downward. For the same reason, `slakshna_local` shows 7.99 contexts per question from shard 0, not 8: on a few questions node 0's own top 8 contains a repeated text.
+
+**L27. Flower's clients run with Hugging Face offline mode (`HF_HUB_OFFLINE=1`) (Claude, 2026-10-25).**
+Flower's client builds a new `Retriever`, and so loads the embedding model, on every query. Online, each load also sends several requests to huggingface.co. On the HPC the first 20 questions of the full `book` run took 1,073 s each on average, against about 9 s per question in the laptop test. The model is already cached by `build_indexes.sh`, so the clients now read it from disk only. Measured on the HPC, one client's model load took 1,056 s online and 6.6 s offline; its search took 6–9 s either way.
+*Why:* network calls to an outside website, made without a token from a shared address, measure the website's rate limits, not Flower's design. Offline mode keeps Flower's real behaviour (reloading the model and index from disk on every query) and removes only the outside dependency. The 20 slow rows were set aside, not reported.
+
+## M. Publishing the work as the `RAG` branch of the original repository
+
+**M1. The `RAG` branch is built on `dcll-iiitd/Slakshna` main as one squashed commit (User, 2026-11-14).**
+This repository (`Slakshna-RAG`) started from a copied snapshot, so its history shares no commits with the original. The branch starts at the original's latest `main` (`8f431c4`) and adds all RAG work as a single commit.
+*Why:* a branch with unrelated history can't be compared with or merged into `main`; one commit keeps the branch easy to review.
+
+**M2. No new `docs/` files and no `CLAUDE.md` go to the `RAG` branch (User, 2026-11-14).**
+The README is the branch's only documentation. Code comments that pointed to `docs/merkle_tree.md` sections or to decision ids were reworded to point to the code (`rag/merkle.py`, `src/rag/merkle.rs`, the shared Merkle fixture) or dropped. `docs/hpc_info.txt` is left out because it holds the HPC's internal address and username.
+*Why:* the design docs are working notes for this repository; the shared repository gets a self-contained README instead.
+
+**M3. Stale files the original already deleted stay deleted; the original `.gitignore`, `.gitmodules`, submodules and `Cargo.lock` are kept (Claude, 2026-11-14).**
+Dockerfile, deploy.sh, docker-compose.yml, benchmark_configs/, plots_script/diag.py, results/benchmark_results_final.csv, scripts/test_*.py and walkthrough280726.md were removed upstream on 2026-11-12 and are not re-added. `scripts/run_mirage_slakshna.py` is left out (superseded, L16). `.gitignore` gains a RAG section, including an exception for `scripts/m9/flower/patch_fedrag.py`, which the `patch_*` rule hid. `src/config.rs` keeps the original's CRLF line endings so its diff shows only real changes. `examples/rag-2node/node1.toml` goes back to `peers = []`.
+*Why:* the branch should differ from `main` only by the RAG work, and an example config must not point at one lab machine.
